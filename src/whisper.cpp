@@ -14,6 +14,8 @@
 #include "openvino/whisper-openvino-encoder.h"
 #endif
 
+#include <sentencepiece_processor.h>
+
 #include <atomic>
 #include <algorithm>
 #include <cassert>
@@ -35,6 +37,11 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+// Fallback version if not defined by CMake
+#ifndef WHISPER_VERSION
+#define WHISPER_VERSION "unknown"
+#endif
 
 #if defined(WHISPER_BIG_ENDIAN)
 template<typename T>
@@ -299,6 +306,7 @@ enum e_model {
     MODEL_SMALL,
     MODEL_MEDIUM,
     MODEL_LARGE,
+    MODEL_MARIAN,  // New Marian model type for translation
 };
 
 static const std::map<e_model, std::string> g_model_name = {
@@ -308,6 +316,7 @@ static const std::map<e_model, std::string> g_model_name = {
     { MODEL_SMALL,    "small"    },
     { MODEL_MEDIUM,   "medium"   },
     { MODEL_LARGE,    "large"    },
+    { MODEL_MARIAN,   "marian"   },
 };
 
 static const std::map<std::string, std::pair<int, std::string>> g_lang = {
@@ -481,6 +490,10 @@ struct whisper_vocab {
     id token_not        = 50362; // no timestamps
     id token_beg        = 50363; // begin timestamps
 
+    // SentencePiece processor for Marian models
+    std::unique_ptr<sentencepiece::SentencePieceProcessor> sp_processor;
+    bool has_sentencepiece = false;
+
     bool is_multilingual() const {
         return n_vocab >= 51865;
     }
@@ -633,6 +646,11 @@ struct whisper_hparams {
     int32_t n_mels        = 80;
     int32_t ftype         = 1;
     float   eps           = 1e-5f;
+    
+    // Marian-specific parameters 
+    int32_t n_src_vocab   = 0;    // Source vocabulary size for Marian translation
+    int32_t n_tgt_vocab   = 0;    // Target vocabulary size for Marian translation
+    int32_t n_max_seq_len = 512;  // Maximum sequence length for Marian
 };
 
 // audio encoding layer
@@ -779,6 +797,18 @@ struct whisper_model {
     // decoder.ln
     struct ggml_tensor * d_ln_w;
     struct ggml_tensor * d_ln_b;
+
+    // Marian-specific tensors
+    struct ggml_tensor * m_encoder_embeddings;     // encoder embeddings (shared)
+    struct ggml_tensor * m_decoder_embeddings;     // decoder embeddings  
+    struct ggml_tensor * m_encoder_pos_emb;        // encoder positional embeddings
+    struct ggml_tensor * m_decoder_pos_emb;        // decoder positional embeddings
+    struct ggml_tensor * m_encoder_norm_w;         // encoder final layer norm weight
+    struct ggml_tensor * m_encoder_norm_b;         // encoder final layer norm bias
+    struct ggml_tensor * m_decoder_norm_w;         // decoder final layer norm weight
+    struct ggml_tensor * m_decoder_norm_b;         // decoder final layer norm bias
+    struct ggml_tensor * m_lm_head_w;              // language model head weight (often shared with embeddings)
+    struct ggml_tensor * m_final_logits_bias;      // final logits bias (shape: 1 x vocab_size)
 
     std::vector<whisper_layer_encoder> layers_encoder;
     std::vector<whisper_layer_decoder> layers_decoder;
@@ -1564,6 +1594,13 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
             }
         }
 
+        // Detect Marian model by vocabulary size > 60000
+        if (hparams.n_vocab > 60000) {
+            model.type = e_model::MODEL_MARIAN;
+            mver = " Marian";
+            WHISPER_LOG_INFO("%s: Detected Marian translation model\n", __func__);
+        }
+
         const int32_t qntvr = hparams.ftype / GGML_QNT_VERSION_FACTOR;
 
         hparams.ftype %= GGML_QNT_VERSION_FACTOR;
@@ -1591,8 +1628,8 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
         WHISPER_LOG_INFO("%s: type          = %d (%s%s)\n", __func__, model.type, g_model_name.at(model.type).c_str(), mver.c_str());
     }
 
-    // load mel filters
-    {
+    // load mel filters (skip for Marian models as they don't use mel spectrograms)
+    if (model.type != e_model::MODEL_MARIAN) {
         auto & filters = wctx.model.filters;
 
         read_safe(loader, filters.n_mel);
@@ -1601,6 +1638,13 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
         filters.data.resize(filters.n_mel * filters.n_fft);
         loader->read(loader->context, filters.data.data(), filters.data.size() * sizeof(float));
         BYTESWAP_FILTERS(filters);
+    } else {
+        // For Marian models, initialize empty filters since they're not used
+        auto & filters = wctx.model.filters;
+        filters.n_mel = 0;
+        filters.n_fft = 0;
+        filters.data.clear();
+        WHISPER_LOG_INFO("%s: Skipping mel filters for Marian model\n", __func__);
     }
 
     // load vocab
@@ -1640,52 +1684,82 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
         }
 
         vocab.n_vocab = model.hparams.n_vocab;
-        if (vocab.is_multilingual()) {
-            vocab.token_eot++;
-            vocab.token_sot++;
-
-            // account for variable number of language tokens
-            const int dt = vocab.num_languages() - 98;
-
-            vocab.token_translate  += dt;
-            vocab.token_transcribe += dt;
-            vocab.token_solm       += dt;
-            vocab.token_prev       += dt;
-            vocab.token_nosp       += dt;
-            vocab.token_not        += dt;
-            vocab.token_beg        += dt;
-        }
-
-        if (n_vocab < model.hparams.n_vocab) {
-            WHISPER_LOG_INFO("%s: adding %d extra tokens\n", __func__, model.hparams.n_vocab - n_vocab);
-            for (int i = n_vocab; i < model.hparams.n_vocab; i++) {
-                if (i > vocab.token_beg) {
-                    word = "[_TT_" + std::to_string(i - vocab.token_beg) + "]";
-                } else if (i == vocab.token_eot) {
-                    word = "[_EOT_]";
-                } else if (i == vocab.token_sot) {
-                    word = "[_SOT_]";
-                } else if (i == vocab.token_translate) {
-                    word = "[_TRANSLATE_]";
-                } else if (i == vocab.token_transcribe) {
-                    word = "[_TRANSCRIBE_]";
-                } else if (i == vocab.token_solm) {
-                    word = "[_SOLM_]";
-                } else if (i == vocab.token_prev) {
-                    word = "[_PREV_]";
-                } else if (i == vocab.token_nosp) {
-                    word = "[_NOSP_]";
-                } else if (i == vocab.token_not) {
-                    word = "[_NOT_]";
-                } else if (i == vocab.token_beg) {
-                    word = "[_BEG_]";
-                } else if (i > vocab.token_sot && i <= vocab.token_sot + vocab.num_languages()) {
-                    word = "[_LANG_" + std::string(whisper_lang_str(i - vocab.token_sot - 1)) + "]";
+        
+        if (model.type == e_model::MODEL_MARIAN) {
+            WHISPER_LOG_INFO("%s: Marian model detected - using complete vocabulary (%d tokens)\n", __func__, n_vocab);
+            vocab.n_vocab = n_vocab;
+            
+            vocab.sp_processor = std::make_unique<sentencepiece::SentencePieceProcessor>();
+            
+            int32_t sp_model_size = 0;
+            read_safe(loader, sp_model_size);
+            
+            if (sp_model_size > 0) {
+                std::vector<char> sp_model_data(sp_model_size);
+                loader->read(loader->context, sp_model_data.data(), sp_model_size);
+                
+                std::string serialized_model(sp_model_data.data(), sp_model_size);
+                auto status = vocab.sp_processor->LoadFromSerializedProto(serialized_model);
+                
+                if (status.ok()) {
+                    vocab.has_sentencepiece = true;
+                    WHISPER_LOG_INFO("%s: SentencePiece processor loaded from serialized model data (%d bytes)\n", __func__, sp_model_size);
                 } else {
-                    word = "[_extra_token_" + std::to_string(i) + "]";
+                    WHISPER_LOG_WARN("%s: Failed to load SentencePiece processor from serialized data: %s\n", __func__, status.ToString().c_str());
+                    vocab.has_sentencepiece = false;
                 }
-                vocab.token_to_id[word] = i;
-                vocab.id_to_token[i] = word;
+            } else {
+                WHISPER_LOG_WARN("%s: No SentencePiece model data found in GGML file. SentencePiece tokenization will not be available.\n", __func__);
+                vocab.has_sentencepiece = false;
+            }
+        } else {
+            if (vocab.is_multilingual()) {
+                vocab.token_eot++;
+                vocab.token_sot++;
+
+                // account for variable number of language tokens
+                const int dt = vocab.num_languages() - 98;
+
+                vocab.token_translate  += dt;
+                vocab.token_transcribe += dt;
+                vocab.token_solm       += dt;
+                vocab.token_prev       += dt;
+                vocab.token_nosp       += dt;
+                vocab.token_not        += dt;
+                vocab.token_beg        += dt;
+            }
+
+            if (n_vocab < model.hparams.n_vocab) {
+                WHISPER_LOG_INFO("%s: adding %d extra tokens\n", __func__, model.hparams.n_vocab - n_vocab);
+                for (int i = n_vocab; i < model.hparams.n_vocab; i++) {
+                    if (i > vocab.token_beg) {
+                        word = "[_TT_" + std::to_string(i - vocab.token_beg) + "]";
+                    } else if (i == vocab.token_eot) {
+                        word = "[_EOT_]";
+                    } else if (i == vocab.token_sot) {
+                        word = "[_SOT_]";
+                    } else if (i == vocab.token_translate) {
+                        word = "[_TRANSLATE_]";
+                    } else if (i == vocab.token_transcribe) {
+                        word = "[_TRANSCRIBE_]";
+                    } else if (i == vocab.token_solm) {
+                        word = "[_SOLM_]";
+                    } else if (i == vocab.token_prev) {
+                        word = "[_PREV_]";
+                    } else if (i == vocab.token_nosp) {
+                        word = "[_NOSP_]";
+                    } else if (i == vocab.token_not) {
+                        word = "[_NOT_]";
+                    } else if (i == vocab.token_beg) {
+                        word = "[_BEG_]";
+                    } else if (i > vocab.token_sot && i <= vocab.token_sot + vocab.num_languages()) {
+                        word = "[_LANG_" + std::string(whisper_lang_str(i - vocab.token_sot - 1)) + "]";
+                    } else {
+                        word = "[_extra_token_" + std::to_string(i) + "]";
+                    }
+                    vocab.token_to_id[word] = i;
+                    vocab.id_to_token[i] = word;
+                }
             }
         }
 
@@ -1700,7 +1774,9 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
     const int n_audio_layer = hparams.n_audio_layer;
     const int n_text_layer  = hparams.n_text_layer;
 
-    const size_t n_tensors = 10 /* input */ + 15 + 15*n_audio_layer + 24*n_text_layer;
+    const size_t n_tensors = (model.type == e_model::MODEL_MARIAN) 
+        ? 20 /* input */ + 18*n_audio_layer /* encoder */ + 28*n_text_layer /* decoder */
+        : 10 /* input */ + 15 + 15*n_audio_layer + 24*n_text_layer;
 
     std::map<ggml_backend_buffer_type_t, ggml_context *> ctx_map;
     auto get_ctx = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
@@ -1772,92 +1848,273 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
         model.layers_encoder.resize(n_audio_layer);
         model.layers_decoder.resize(n_text_layer);
 
-        // encoder
-        model.e_pe = create_tensor(ASR_TENSOR_ENC_POS_EMBD, ASR_SYSTEM_ENCODER, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_audio_state, n_audio_ctx));
+        // encoder (skip Whisper-specific layers for Marian models)
+        if (model.type != e_model::MODEL_MARIAN) {
+            model.e_pe = create_tensor(ASR_TENSOR_ENC_POS_EMBD, ASR_SYSTEM_ENCODER, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_audio_state, n_audio_ctx));
 
-        model.e_conv_1_w = create_tensor(ASR_TENSOR_CONV1_WEIGHT, ASR_SYSTEM_ENCODER, ggml_new_tensor_3d(ctx, vtype, 3, n_mels, n_audio_state));
-        model.e_conv_1_b = create_tensor(ASR_TENSOR_CONV1_BIAS, ASR_SYSTEM_ENCODER, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n_audio_state));
+            model.e_conv_1_w = create_tensor(ASR_TENSOR_CONV1_WEIGHT, ASR_SYSTEM_ENCODER, ggml_new_tensor_3d(ctx, vtype, 3, n_mels, n_audio_state));
+            model.e_conv_1_b = create_tensor(ASR_TENSOR_CONV1_BIAS, ASR_SYSTEM_ENCODER, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n_audio_state));
 
-        model.e_conv_2_w = create_tensor(ASR_TENSOR_CONV2_WEIGHT, ASR_SYSTEM_ENCODER, ggml_new_tensor_3d(ctx, vtype, 3, n_audio_state, n_audio_state));
-        model.e_conv_2_b = create_tensor(ASR_TENSOR_CONV2_BIAS, ASR_SYSTEM_ENCODER, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n_audio_state));
+            model.e_conv_2_w = create_tensor(ASR_TENSOR_CONV2_WEIGHT, ASR_SYSTEM_ENCODER, ggml_new_tensor_3d(ctx, vtype, 3, n_audio_state, n_audio_state));
+            model.e_conv_2_b = create_tensor(ASR_TENSOR_CONV2_BIAS, ASR_SYSTEM_ENCODER, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n_audio_state));
 
-        model.e_ln_w = create_tensor(ASR_TENSOR_LN_WEIGHT, ASR_SYSTEM_ENCODER, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_audio_state));
-        model.e_ln_b = create_tensor(ASR_TENSOR_LN_POST_BIAS, ASR_SYSTEM_ENCODER, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_audio_state));
+            model.e_ln_w = create_tensor(ASR_TENSOR_LN_WEIGHT, ASR_SYSTEM_ENCODER, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_audio_state));
+            model.e_ln_b = create_tensor(ASR_TENSOR_LN_POST_BIAS, ASR_SYSTEM_ENCODER, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_audio_state));
+        } else {
+            // For Marian models, these tensors are not used (text-to-text translation)
+            model.e_pe = nullptr;
+            model.e_conv_1_w = nullptr;
+            model.e_conv_1_b = nullptr;
+            model.e_conv_2_w = nullptr;
+            model.e_conv_2_b = nullptr;
+            model.e_ln_w = nullptr;
+            model.e_ln_b = nullptr;
+            WHISPER_LOG_INFO("%s: Skipping Whisper-specific encoder tensors for Marian model\n", __func__);
+        }
 
+        // Create encoder layers - use standard ASR tensor system for compatibility
         for (int i = 0; i < n_audio_layer; ++i) {
             auto & layer = model.layers_encoder[i];
 
-            layer.mlp_ln_w = create_tensor(ASR_TENSOR_MLP_LN_WEIGHT, ASR_SYSTEM_ENCODER, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_audio_state), i);
-            layer.mlp_ln_b = create_tensor(ASR_TENSOR_MLP_LN_BIAS, ASR_SYSTEM_ENCODER, ggml_new_tensor_1d(ctx, GGML_TYPE_F32,   n_audio_state), i);
+            if (model.type == e_model::MODEL_MARIAN) {
+                // For Marian models, use direct tensor mapping to match conversion script names
+                ggml_context * marian_ctx = get_ctx(select_weight_buft(hparams, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_audio_state), GGML_OP_NONE, buft_list));
+                
+                layer.attn_ln_0_w = ggml_dup_tensor(marian_ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_audio_state));
+                layer.attn_ln_0_b = ggml_dup_tensor(marian_ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_audio_state));
+                layer.attn_q_w = ggml_dup_tensor(marian_ctx, ggml_new_tensor_2d(ctx, wtype, n_audio_state, n_audio_state));
+                layer.attn_q_b = ggml_dup_tensor(marian_ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_audio_state));
+                layer.attn_k_w = ggml_dup_tensor(marian_ctx, ggml_new_tensor_2d(ctx, wtype, n_audio_state, n_audio_state));
+                // Create k_proj bias tensor even though it might be unused in standard Marian
+                ggml_tensor * attn_k_b = ggml_dup_tensor(marian_ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_audio_state));
+                layer.attn_v_w = ggml_dup_tensor(marian_ctx, ggml_new_tensor_2d(ctx, wtype, n_audio_state, n_audio_state));
+                layer.attn_v_b = ggml_dup_tensor(marian_ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_audio_state));
+                layer.attn_ln_1_w = ggml_dup_tensor(marian_ctx, ggml_new_tensor_2d(ctx, wtype, n_audio_state, n_audio_state));
+                layer.attn_ln_1_b = ggml_dup_tensor(marian_ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_audio_state));
+                layer.mlp_ln_w = ggml_dup_tensor(marian_ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_audio_state));
+                layer.mlp_ln_b = ggml_dup_tensor(marian_ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_audio_state));
+                layer.mlp_0_w = ggml_dup_tensor(marian_ctx, ggml_new_tensor_2d(ctx, wtype, n_audio_state, 4*n_audio_state));
+                layer.mlp_0_b = ggml_dup_tensor(marian_ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4*n_audio_state));
+                layer.mlp_1_w = ggml_dup_tensor(marian_ctx, ggml_new_tensor_2d(ctx, wtype, 4*n_audio_state, n_audio_state));
+                layer.mlp_1_b = ggml_dup_tensor(marian_ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_audio_state));
+                
+                // Map encoder tensors to match conversion script output
+                model.tensors[format("encoder.layers.%d.self_attn_layer_norm.weight", i)] = layer.attn_ln_0_w;
+                model.tensors[format("encoder.layers.%d.self_attn_layer_norm.bias", i)] = layer.attn_ln_0_b;
+                model.tensors[format("encoder.layers.%d.self_attn.q_proj.weight", i)] = layer.attn_q_w;
+                model.tensors[format("encoder.layers.%d.self_attn.q_proj.bias", i)] = layer.attn_q_b;
+                model.tensors[format("encoder.layers.%d.self_attn.k_proj.weight", i)] = layer.attn_k_w;
+                model.tensors[format("encoder.layers.%d.self_attn.k_proj.bias", i)] = attn_k_b;
+                model.tensors[format("encoder.layers.%d.self_attn.v_proj.weight", i)] = layer.attn_v_w;
+                model.tensors[format("encoder.layers.%d.self_attn.v_proj.bias", i)] = layer.attn_v_b;
+                model.tensors[format("encoder.layers.%d.self_attn.out_proj.weight", i)] = layer.attn_ln_1_w;
+                model.tensors[format("encoder.layers.%d.self_attn.out_proj.bias", i)] = layer.attn_ln_1_b;
+                model.tensors[format("encoder.layers.%d.final_layer_norm.weight", i)] = layer.mlp_ln_w;
+                model.tensors[format("encoder.layers.%d.final_layer_norm.bias", i)] = layer.mlp_ln_b;
+                model.tensors[format("encoder.layers.%d.fc1.weight", i)] = layer.mlp_0_w;
+                model.tensors[format("encoder.layers.%d.fc1.bias", i)] = layer.mlp_0_b;
+                model.tensors[format("encoder.layers.%d.fc2.weight", i)] = layer.mlp_1_w;
+                model.tensors[format("encoder.layers.%d.fc2.bias", i)] = layer.mlp_1_b;
+            } else {
+                // Standard Whisper encoder layers
+                layer.mlp_ln_w = create_tensor(ASR_TENSOR_MLP_LN_WEIGHT, ASR_SYSTEM_ENCODER, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_audio_state), i);
+                layer.mlp_ln_b = create_tensor(ASR_TENSOR_MLP_LN_BIAS, ASR_SYSTEM_ENCODER, ggml_new_tensor_1d(ctx, GGML_TYPE_F32,   n_audio_state), i);
 
-            layer.mlp_0_w = create_tensor(ASR_TENSOR_MLP_0_WEIGHT, ASR_SYSTEM_ENCODER, ggml_new_tensor_2d(ctx, wtype, n_audio_state, 4*n_audio_state), i);
-            layer.mlp_0_b = create_tensor(ASR_TENSOR_MLP_0_BIAS, ASR_SYSTEM_ENCODER, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4*n_audio_state), i);
+                layer.mlp_0_w = create_tensor(ASR_TENSOR_MLP_0_WEIGHT, ASR_SYSTEM_ENCODER, ggml_new_tensor_2d(ctx, wtype, n_audio_state, 4*n_audio_state), i);
+                layer.mlp_0_b = create_tensor(ASR_TENSOR_MLP_0_BIAS, ASR_SYSTEM_ENCODER, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4*n_audio_state), i);
 
-            layer.mlp_1_w = create_tensor(ASR_TENSOR_MLP_2_WEIGHT, ASR_SYSTEM_ENCODER, ggml_new_tensor_2d(ctx, wtype, 4*n_audio_state, n_audio_state), i);
-            layer.mlp_1_b = create_tensor(ASR_TENSOR_MLP_2_BIAS, ASR_SYSTEM_ENCODER, ggml_new_tensor_1d(ctx, GGML_TYPE_F32,   n_audio_state), i);
+                layer.mlp_1_w = create_tensor(ASR_TENSOR_MLP_2_WEIGHT, ASR_SYSTEM_ENCODER, ggml_new_tensor_2d(ctx, wtype, 4*n_audio_state, n_audio_state), i);
+                layer.mlp_1_b = create_tensor(ASR_TENSOR_MLP_2_BIAS, ASR_SYSTEM_ENCODER, ggml_new_tensor_1d(ctx, GGML_TYPE_F32,   n_audio_state), i);
 
-            layer.attn_ln_0_w = create_tensor(ASR_TENSOR_ATTN_LN_WEIGHT, ASR_SYSTEM_ENCODER, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_audio_state), i);
-            layer.attn_ln_0_b = create_tensor(ASR_TENSOR_ATTN_LN_BIAS, ASR_SYSTEM_ENCODER, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_audio_state), i);
+                layer.attn_ln_0_w = create_tensor(ASR_TENSOR_ATTN_LN_WEIGHT, ASR_SYSTEM_ENCODER, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_audio_state), i);
+                layer.attn_ln_0_b = create_tensor(ASR_TENSOR_ATTN_LN_BIAS, ASR_SYSTEM_ENCODER, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_audio_state), i);
 
-            layer.attn_q_w = create_tensor(ASR_TENSOR_ATTN_QUERY_WEIGHT, ASR_SYSTEM_ENCODER, ggml_new_tensor_2d(ctx, wtype, n_audio_state, n_audio_state), i);
-            layer.attn_q_b = create_tensor(ASR_TENSOR_ATTN_QUERY_BIAS, ASR_SYSTEM_ENCODER, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_audio_state), i);
+                layer.attn_q_w = create_tensor(ASR_TENSOR_ATTN_QUERY_WEIGHT, ASR_SYSTEM_ENCODER, ggml_new_tensor_2d(ctx, wtype, n_audio_state, n_audio_state), i);
+                layer.attn_q_b = create_tensor(ASR_TENSOR_ATTN_QUERY_BIAS, ASR_SYSTEM_ENCODER, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_audio_state), i);
 
-            layer.attn_k_w = create_tensor(ASR_TENSOR_ATTN_KEY_WEIGHT, ASR_SYSTEM_ENCODER, ggml_new_tensor_2d(ctx, wtype, n_audio_state, n_audio_state), i);
+                layer.attn_k_w = create_tensor(ASR_TENSOR_ATTN_KEY_WEIGHT, ASR_SYSTEM_ENCODER, ggml_new_tensor_2d(ctx, wtype, n_audio_state, n_audio_state), i);
 
-            layer.attn_v_w = create_tensor(ASR_TENSOR_ATTN_VALUE_WEIGHT, ASR_SYSTEM_ENCODER, ggml_new_tensor_2d(ctx, wtype, n_audio_state, n_audio_state), i);
-            layer.attn_v_b = create_tensor(ASR_TENSOR_ATTN_VALUE_BIAS, ASR_SYSTEM_ENCODER, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_audio_state), i);
+                layer.attn_v_w = create_tensor(ASR_TENSOR_ATTN_VALUE_WEIGHT, ASR_SYSTEM_ENCODER, ggml_new_tensor_2d(ctx, wtype, n_audio_state, n_audio_state), i);
+                layer.attn_v_b = create_tensor(ASR_TENSOR_ATTN_VALUE_BIAS, ASR_SYSTEM_ENCODER, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_audio_state), i);
 
-            layer.attn_ln_1_w = create_tensor(ASR_TENSOR_ATTN_OUT_WEIGHT, ASR_SYSTEM_ENCODER, ggml_new_tensor_2d(ctx, wtype, n_audio_state, n_audio_state), i);
-            layer.attn_ln_1_b = create_tensor(ASR_TENSOR_ATTN_OUT_BIAS, ASR_SYSTEM_ENCODER, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_audio_state), i);
+                layer.attn_ln_1_w = create_tensor(ASR_TENSOR_ATTN_OUT_WEIGHT, ASR_SYSTEM_ENCODER, ggml_new_tensor_2d(ctx, wtype, n_audio_state, n_audio_state), i);
+                layer.attn_ln_1_b = create_tensor(ASR_TENSOR_ATTN_OUT_BIAS, ASR_SYSTEM_ENCODER, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_audio_state), i);
+            }
         }
 
-        // decoder
-        model.d_pe = create_tensor(ASR_TENSOR_DEC_POS_EMBD, ASR_SYSTEM_DECODER, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_text_state, n_text_ctx));
+        // decoder (skip Whisper-specific layers for Marian models)
+        if (model.type != e_model::MODEL_MARIAN) {
+            model.d_pe = create_tensor(ASR_TENSOR_DEC_POS_EMBD, ASR_SYSTEM_DECODER, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_text_state, n_text_ctx));
 
-        model.d_te = create_tensor(ASR_TENSOR_DEC_TOKEN_EMBD_WEIGHT, ASR_SYSTEM_DECODER, ggml_new_tensor_2d(ctx, wtype, n_text_state, n_vocab));
+            model.d_te = create_tensor(ASR_TENSOR_DEC_TOKEN_EMBD_WEIGHT, ASR_SYSTEM_DECODER, ggml_new_tensor_2d(ctx, wtype, n_text_state, n_vocab));
 
-        model.d_ln_w = create_tensor(ASR_TENSOR_LN_WEIGHT, ASR_SYSTEM_DECODER, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state));
-        model.d_ln_b = create_tensor(ASR_TENSOR_LN_BIAS, ASR_SYSTEM_DECODER, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state));
+            model.d_ln_w = create_tensor(ASR_TENSOR_LN_WEIGHT, ASR_SYSTEM_DECODER, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state));
+            model.d_ln_b = create_tensor(ASR_TENSOR_LN_BIAS, ASR_SYSTEM_DECODER, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state));
+        } else {
+            // For Marian models, these will be handled by Marian-specific tensors
+            model.d_pe = nullptr;
+            model.d_te = nullptr;
+            model.d_ln_w = nullptr;
+            model.d_ln_b = nullptr;
+            WHISPER_LOG_INFO("%s: Skipping Whisper-specific decoder tensors for Marian model\n", __func__);
+        }
 
         for (int i = 0; i < n_text_layer; ++i) {
             auto & layer = model.layers_decoder[i];
 
-            layer.mlp_ln_w = create_tensor(ASR_TENSOR_MLP_LN_WEIGHT, ASR_SYSTEM_DECODER, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state), i);
-            layer.mlp_ln_b = create_tensor(ASR_TENSOR_MLP_LN_BIAS, ASR_SYSTEM_DECODER, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state), i);
+            if (model.type == e_model::MODEL_MARIAN) {
+                // For Marian models, use direct tensor mapping to match conversion script names
+                ggml_context * marian_ctx = get_ctx(select_weight_buft(hparams, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state), GGML_OP_NONE, buft_list));
+                
+                // Self-attention tensors
+                layer.attn_ln_0_w = ggml_dup_tensor(marian_ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state));
+                layer.attn_ln_0_b = ggml_dup_tensor(marian_ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state));
+                layer.attn_q_w = ggml_dup_tensor(marian_ctx, ggml_new_tensor_2d(ctx, wtype, n_text_state, n_text_state));
+                layer.attn_q_b = ggml_dup_tensor(marian_ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state));
+                layer.attn_k_w = ggml_dup_tensor(marian_ctx, ggml_new_tensor_2d(ctx, wtype, n_text_state, n_text_state));
+                ggml_tensor * attn_k_b = ggml_dup_tensor(marian_ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state));
+                layer.attn_v_w = ggml_dup_tensor(marian_ctx, ggml_new_tensor_2d(ctx, wtype, n_text_state, n_text_state));
+                layer.attn_v_b = ggml_dup_tensor(marian_ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state));
+                layer.attn_ln_1_w = ggml_dup_tensor(marian_ctx, ggml_new_tensor_2d(ctx, wtype, n_text_state, n_text_state));
+                layer.attn_ln_1_b = ggml_dup_tensor(marian_ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state));
+                
+                // Cross-attention tensors
+                layer.cross_attn_ln_0_w = ggml_dup_tensor(marian_ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state));
+                layer.cross_attn_ln_0_b = ggml_dup_tensor(marian_ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state));
+                layer.cross_attn_q_w = ggml_dup_tensor(marian_ctx, ggml_new_tensor_2d(ctx, wtype, n_text_state, n_text_state));
+                layer.cross_attn_q_b = ggml_dup_tensor(marian_ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state));
+                layer.cross_attn_k_w = ggml_dup_tensor(marian_ctx, ggml_new_tensor_2d(ctx, wtype, n_text_state, n_text_state));
+                ggml_tensor * cross_attn_k_b = ggml_dup_tensor(marian_ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state));
+                layer.cross_attn_v_w = ggml_dup_tensor(marian_ctx, ggml_new_tensor_2d(ctx, wtype, n_text_state, n_text_state));
+                layer.cross_attn_v_b = ggml_dup_tensor(marian_ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state));
+                layer.cross_attn_ln_1_w = ggml_dup_tensor(marian_ctx, ggml_new_tensor_2d(ctx, wtype, n_text_state, n_text_state));
+                layer.cross_attn_ln_1_b = ggml_dup_tensor(marian_ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state));
+                
+                // MLP tensors
+                layer.mlp_ln_w = ggml_dup_tensor(marian_ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state));
+                layer.mlp_ln_b = ggml_dup_tensor(marian_ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state));
+                layer.mlp_0_w = ggml_dup_tensor(marian_ctx, ggml_new_tensor_2d(ctx, wtype, n_text_state, 4*n_text_state));
+                layer.mlp_0_b = ggml_dup_tensor(marian_ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4*n_text_state));
+                layer.mlp_1_w = ggml_dup_tensor(marian_ctx, ggml_new_tensor_2d(ctx, wtype, 4*n_text_state, n_text_state));
+                layer.mlp_1_b = ggml_dup_tensor(marian_ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state));
+                
+                // Map decoder tensors to match conversion script output
+                // Self-attention
+                model.tensors[format("decoder.blocks.%d.attn_ln.weight", i)] = layer.attn_ln_0_w;
+                model.tensors[format("decoder.blocks.%d.attn_ln.bias", i)] = layer.attn_ln_0_b;
+                model.tensors[format("decoder.blocks.%d.attn.query.weight", i)] = layer.attn_q_w;
+                model.tensors[format("decoder.blocks.%d.attn.query.bias", i)] = layer.attn_q_b;
+                model.tensors[format("decoder.blocks.%d.attn.key.weight", i)] = layer.attn_k_w;
+                model.tensors[format("decoder.blocks.%d.attn.key.bias", i)] = attn_k_b;
+                model.tensors[format("decoder.blocks.%d.attn.value.weight", i)] = layer.attn_v_w;
+                model.tensors[format("decoder.blocks.%d.attn.value.bias", i)] = layer.attn_v_b;
+                model.tensors[format("decoder.blocks.%d.attn.out.weight", i)] = layer.attn_ln_1_w;
+                model.tensors[format("decoder.blocks.%d.attn.out.bias", i)] = layer.attn_ln_1_b;
+                
+                // Cross-attention
+                model.tensors[format("decoder.blocks.%d.cross_attn_ln.weight", i)] = layer.cross_attn_ln_0_w;
+                model.tensors[format("decoder.blocks.%d.cross_attn_ln.bias", i)] = layer.cross_attn_ln_0_b;
+                model.tensors[format("decoder.blocks.%d.cross_attn.query.weight", i)] = layer.cross_attn_q_w;
+                model.tensors[format("decoder.blocks.%d.cross_attn.query.bias", i)] = layer.cross_attn_q_b;
+                model.tensors[format("decoder.blocks.%d.cross_attn.key.weight", i)] = layer.cross_attn_k_w;
+                model.tensors[format("decoder.blocks.%d.cross_attn.key.bias", i)] = cross_attn_k_b;
+                model.tensors[format("decoder.blocks.%d.cross_attn.value.weight", i)] = layer.cross_attn_v_w;
+                model.tensors[format("decoder.blocks.%d.cross_attn.value.bias", i)] = layer.cross_attn_v_b;
+                model.tensors[format("decoder.blocks.%d.cross_attn.out.weight", i)] = layer.cross_attn_ln_1_w;
+                model.tensors[format("decoder.blocks.%d.cross_attn.out.bias", i)] = layer.cross_attn_ln_1_b;
+                
+                // MLP
+                model.tensors[format("decoder.blocks.%d.mlp_ln.weight", i)] = layer.mlp_ln_w;
+                model.tensors[format("decoder.blocks.%d.mlp_ln.bias", i)] = layer.mlp_ln_b;
+                model.tensors[format("decoder.blocks.%d.mlp.0.weight", i)] = layer.mlp_0_w;
+                model.tensors[format("decoder.blocks.%d.mlp.0.bias", i)] = layer.mlp_0_b;
+                model.tensors[format("decoder.blocks.%d.mlp.2.weight", i)] = layer.mlp_1_w;
+                model.tensors[format("decoder.blocks.%d.mlp.2.bias", i)] = layer.mlp_1_b;
+            } else {
+                // Standard Whisper decoder layers
+                layer.mlp_ln_w = create_tensor(ASR_TENSOR_MLP_LN_WEIGHT, ASR_SYSTEM_DECODER, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state), i);
+                layer.mlp_ln_b = create_tensor(ASR_TENSOR_MLP_LN_BIAS, ASR_SYSTEM_DECODER, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state), i);
 
-            layer.mlp_0_w = create_tensor(ASR_TENSOR_MLP_0_WEIGHT, ASR_SYSTEM_DECODER, ggml_new_tensor_2d(ctx, wtype, n_text_state, 4*n_text_state), i);
-            layer.mlp_0_b = create_tensor(ASR_TENSOR_MLP_0_BIAS, ASR_SYSTEM_DECODER, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4*n_text_state), i);
+                layer.mlp_0_w = create_tensor(ASR_TENSOR_MLP_0_WEIGHT, ASR_SYSTEM_DECODER, ggml_new_tensor_2d(ctx, wtype, n_text_state, 4*n_text_state), i);
+                layer.mlp_0_b = create_tensor(ASR_TENSOR_MLP_0_BIAS, ASR_SYSTEM_DECODER, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 4*n_text_state), i);
 
-            layer.mlp_1_w = create_tensor(ASR_TENSOR_MLP_2_WEIGHT, ASR_SYSTEM_DECODER, ggml_new_tensor_2d(ctx, wtype, 4*n_text_state, n_text_state), i);
-            layer.mlp_1_b = create_tensor(ASR_TENSOR_MLP_2_BIAS, ASR_SYSTEM_DECODER, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state), i);
+                layer.mlp_1_w = create_tensor(ASR_TENSOR_MLP_2_WEIGHT, ASR_SYSTEM_DECODER, ggml_new_tensor_2d(ctx, wtype, 4*n_text_state, n_text_state), i);
+                layer.mlp_1_b = create_tensor(ASR_TENSOR_MLP_2_BIAS, ASR_SYSTEM_DECODER, ggml_new_tensor_1d(ctx, GGML_TYPE_F32,   n_text_state), i);
 
-            layer.attn_ln_0_w = create_tensor(ASR_TENSOR_ATTN_LN_WEIGHT, ASR_SYSTEM_DECODER, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state), i);
-            layer.attn_ln_0_b = create_tensor(ASR_TENSOR_ATTN_LN_BIAS, ASR_SYSTEM_DECODER, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state), i);
+                layer.attn_ln_0_w = create_tensor(ASR_TENSOR_ATTN_LN_WEIGHT, ASR_SYSTEM_DECODER, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state), i);
+                layer.attn_ln_0_b = create_tensor(ASR_TENSOR_ATTN_LN_BIAS, ASR_SYSTEM_DECODER, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state), i);
 
-            layer.attn_q_w = create_tensor(ASR_TENSOR_ATTN_QUERY_WEIGHT, ASR_SYSTEM_DECODER, ggml_new_tensor_2d(ctx, wtype, n_text_state, n_text_state), i);
-            layer.attn_q_b = create_tensor(ASR_TENSOR_ATTN_QUERY_BIAS, ASR_SYSTEM_DECODER, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state), i);
+                layer.attn_q_w = create_tensor(ASR_TENSOR_ATTN_QUERY_WEIGHT, ASR_SYSTEM_DECODER, ggml_new_tensor_2d(ctx, wtype, n_text_state, n_text_state), i);
+                layer.attn_q_b = create_tensor(ASR_TENSOR_ATTN_QUERY_BIAS, ASR_SYSTEM_DECODER, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state), i);
 
-            layer.attn_k_w = create_tensor(ASR_TENSOR_ATTN_KEY_WEIGHT, ASR_SYSTEM_DECODER, ggml_new_tensor_2d(ctx, wtype, n_text_state, n_text_state), i);
+                layer.attn_k_w = create_tensor(ASR_TENSOR_ATTN_KEY_WEIGHT, ASR_SYSTEM_DECODER, ggml_new_tensor_2d(ctx, wtype, n_text_state, n_text_state), i);
 
-            layer.attn_v_w = create_tensor(ASR_TENSOR_ATTN_VALUE_WEIGHT, ASR_SYSTEM_DECODER, ggml_new_tensor_2d(ctx, wtype, n_text_state, n_text_state), i);
-            layer.attn_v_b = create_tensor(ASR_TENSOR_ATTN_VALUE_BIAS, ASR_SYSTEM_DECODER, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state), i);
+                layer.attn_v_w = create_tensor(ASR_TENSOR_ATTN_VALUE_WEIGHT, ASR_SYSTEM_DECODER, ggml_new_tensor_2d(ctx, wtype, n_text_state, n_text_state), i);
+                layer.attn_v_b = create_tensor(ASR_TENSOR_ATTN_VALUE_BIAS, ASR_SYSTEM_DECODER, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state), i);
 
-            layer.attn_ln_1_w = create_tensor(ASR_TENSOR_ATTN_OUT_WEIGHT, ASR_SYSTEM_DECODER, ggml_new_tensor_2d(ctx, wtype, n_text_state, n_text_state), i);
-            layer.attn_ln_1_b = create_tensor(ASR_TENSOR_ATTN_OUT_BIAS, ASR_SYSTEM_DECODER, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state), i);
+                layer.attn_ln_1_w = create_tensor(ASR_TENSOR_ATTN_OUT_WEIGHT, ASR_SYSTEM_DECODER, ggml_new_tensor_2d(ctx, wtype, n_text_state, n_text_state), i);
+                layer.attn_ln_1_b = create_tensor(ASR_TENSOR_ATTN_OUT_BIAS, ASR_SYSTEM_DECODER, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state), i);
 
-            layer.cross_attn_ln_0_w = create_tensor(ASR_TENSOR_ATTN_LN_WEIGHT, ASR_SYSTEM_CROSS, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state), i);
-            layer.cross_attn_ln_0_b = create_tensor(ASR_TENSOR_ATTN_LN_BIAS, ASR_SYSTEM_CROSS, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state), i);
+                layer.cross_attn_ln_0_w = create_tensor(ASR_TENSOR_ATTN_LN_WEIGHT, ASR_SYSTEM_CROSS, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state), i);
+                layer.cross_attn_ln_0_b = create_tensor(ASR_TENSOR_ATTN_LN_BIAS, ASR_SYSTEM_CROSS, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state), i);
 
-            layer.cross_attn_q_w = create_tensor(ASR_TENSOR_ATTN_QUERY_WEIGHT, ASR_SYSTEM_CROSS, ggml_new_tensor_2d(ctx, wtype, n_text_state, n_text_state), i);
-            layer.cross_attn_q_b = create_tensor(ASR_TENSOR_ATTN_QUERY_BIAS, ASR_SYSTEM_CROSS, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state), i);
+                layer.cross_attn_q_w = create_tensor(ASR_TENSOR_ATTN_QUERY_WEIGHT, ASR_SYSTEM_CROSS, ggml_new_tensor_2d(ctx, wtype, n_text_state, n_text_state), i);
+                layer.cross_attn_q_b = create_tensor(ASR_TENSOR_ATTN_QUERY_BIAS, ASR_SYSTEM_CROSS, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state), i);
 
-            layer.cross_attn_k_w = create_tensor(ASR_TENSOR_ATTN_KEY_WEIGHT, ASR_SYSTEM_CROSS, ggml_new_tensor_2d(ctx, wtype, n_text_state, n_text_state), i);
+                layer.cross_attn_k_w = create_tensor(ASR_TENSOR_ATTN_KEY_WEIGHT, ASR_SYSTEM_CROSS, ggml_new_tensor_2d(ctx, wtype, n_text_state, n_text_state), i);
 
-            layer.cross_attn_v_w = create_tensor(ASR_TENSOR_ATTN_VALUE_WEIGHT, ASR_SYSTEM_CROSS, ggml_new_tensor_2d(ctx, wtype, n_text_state, n_text_state), i);
-            layer.cross_attn_v_b = create_tensor(ASR_TENSOR_ATTN_VALUE_BIAS, ASR_SYSTEM_CROSS, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state), i);
+                layer.cross_attn_v_w = create_tensor(ASR_TENSOR_ATTN_VALUE_WEIGHT, ASR_SYSTEM_CROSS, ggml_new_tensor_2d(ctx, wtype, n_text_state, n_text_state), i);
+                layer.cross_attn_v_b = create_tensor(ASR_TENSOR_ATTN_VALUE_BIAS, ASR_SYSTEM_CROSS, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state), i);
 
-            layer.cross_attn_ln_1_w = create_tensor(ASR_TENSOR_ATTN_OUT_WEIGHT, ASR_SYSTEM_CROSS, ggml_new_tensor_2d(ctx, wtype, n_text_state, n_text_state), i);
-            layer.cross_attn_ln_1_b = create_tensor(ASR_TENSOR_ATTN_OUT_BIAS, ASR_SYSTEM_CROSS, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state), i);
+                layer.cross_attn_ln_1_w = create_tensor(ASR_TENSOR_ATTN_OUT_WEIGHT, ASR_SYSTEM_CROSS, ggml_new_tensor_2d(ctx, wtype, n_text_state, n_text_state), i);
+                layer.cross_attn_ln_1_b = create_tensor(ASR_TENSOR_ATTN_OUT_BIAS, ASR_SYSTEM_CROSS, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state), i);
+            }
+        }
+
+        // Marian-specific tensors (only for Marian models)
+        if (model.type == e_model::MODEL_MARIAN) {
+            // Create meta tensors that will be allocated later with proper backend
+            ggml_tensor * meta_encoder_emb = ggml_new_tensor_2d(ctx, wtype, n_text_state, n_vocab);
+            ggml_tensor * meta_decoder_emb = ggml_new_tensor_2d(ctx, wtype, n_text_state, n_vocab);
+            ggml_tensor * meta_enc_pos_emb = ggml_new_tensor_2d(ctx, wtype, n_text_state, n_text_ctx);  // Shape: (512, 512) 
+            ggml_tensor * meta_dec_pos_emb = ggml_new_tensor_2d(ctx, wtype, n_text_state, n_text_ctx);  // Shape: (512, 512)
+            ggml_tensor * meta_enc_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state);
+            ggml_tensor * meta_enc_norm_b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state);
+            ggml_tensor * meta_dec_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state);
+            ggml_tensor * meta_dec_norm_b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state);
+            ggml_tensor * meta_lm_head = ggml_new_tensor_2d(ctx, wtype, n_text_state, n_vocab);
+            ggml_tensor * meta_final_logits_bias = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_vocab, 1);  // Shape: (vocab_size, 1)
+            
+            // Allocate tensors using backend system
+            ggml_backend_buffer_type_t buft = select_weight_buft(hparams, meta_encoder_emb, GGML_OP_NONE, buft_list);
+            ggml_context * marian_ctx = get_ctx(buft);
+            
+            model.m_encoder_embeddings = ggml_dup_tensor(marian_ctx, meta_encoder_emb);
+            model.m_decoder_embeddings = ggml_dup_tensor(marian_ctx, meta_decoder_emb);
+            model.m_encoder_pos_emb = ggml_dup_tensor(marian_ctx, meta_enc_pos_emb);
+            model.m_decoder_pos_emb = ggml_dup_tensor(marian_ctx, meta_dec_pos_emb);
+            model.m_encoder_norm_w = ggml_dup_tensor(marian_ctx, meta_enc_norm_w);
+            model.m_encoder_norm_b = ggml_dup_tensor(marian_ctx, meta_enc_norm_b);
+            model.m_decoder_norm_w = ggml_dup_tensor(marian_ctx, meta_dec_norm_w);
+            model.m_decoder_norm_b = ggml_dup_tensor(marian_ctx, meta_dec_norm_b);
+            model.m_lm_head_w = ggml_dup_tensor(marian_ctx, meta_lm_head);
+            model.m_final_logits_bias = ggml_dup_tensor(marian_ctx, meta_final_logits_bias);
+            
+            // Map to tensor names from conversion script
+            model.tensors["encoder.embeddings.weight"] = model.m_encoder_embeddings;
+            model.tensors["decoder.embeddings.weight"] = model.m_decoder_embeddings;
+            model.tensors["encoder.embed_positions.weight"] = model.m_encoder_pos_emb;
+            model.tensors["decoder.embed_positions.weight"] = model.m_decoder_pos_emb;
+            // NOTE: Marian models do NOT have top-level encoder/decoder layer norms
+            // They only have per-layer norms - removing these 4 non-existent tensors:
+            // model.tensors["encoder.layer_norm.weight"] = model.m_encoder_norm_w;
+            // model.tensors["encoder.layer_norm.bias"] = model.m_encoder_norm_b;
+            // model.tensors["decoder.layer_norm.weight"] = model.m_decoder_norm_w;
+            // model.tensors["decoder.layer_norm.bias"] = model.m_decoder_norm_b;
+            model.tensors["lm_head.weight"] = model.m_lm_head_w;
+            model.tensors["final_logits_bias"] = model.m_final_logits_bias;
+
+            WHISPER_LOG_INFO("%s: Marian-specific tensors created\n", __func__);
         }
 
         ggml_free(ctx);
@@ -3275,6 +3532,41 @@ static bool log_mel_spectrogram(
     return true;
 }
 
+// SentencePiece tokenization for Marian models
+static std::vector<whisper_vocab::id> tokenize_sentencepiece(const whisper_vocab & vocab, const std::string & text) {
+    std::vector<whisper_vocab::id> tokens;
+    
+    if (!vocab.sp_processor || !vocab.has_sentencepiece) {
+        WHISPER_LOG_ERROR("SentencePiece processor not initialized for Marian model\n");
+        return tokens;
+    }
+    
+    std::vector<std::string> pieces;
+    if (!vocab.sp_processor->Encode(text, &pieces).ok()) {
+        WHISPER_LOG_ERROR("Failed to tokenize text with SentencePiece\n");
+        return tokens;
+    }
+    
+    tokens.reserve(pieces.size());
+    for (const std::string & piece : pieces) {
+        auto it = vocab.token_to_id.find(piece);
+        if (it != vocab.token_to_id.end()) {
+            tokens.push_back(it->second);
+        } else {
+            WHISPER_LOG_WARN("SentencePiece piece '%s' not found in vocabulary, using <unk>\n", piece.c_str());
+            auto unk_it = vocab.token_to_id.find("<unk>");
+            if (unk_it != vocab.token_to_id.end()) {
+                tokens.push_back(unk_it->second);
+            } else {
+                throw std::runtime_error("SentencePiece piece not found in vocabulary and <unk> not found");
+            }
+        }
+    }
+    
+    return tokens;
+}
+
+// BPE tokenization for Whisper models
 // split text into tokens
 //
 // ref: https://github.com/openai/gpt-2/blob/a74da5d99abaaba920de8131d64da2862a8f213b/src/encoder.py#L53
@@ -3285,7 +3577,7 @@ static bool log_mel_spectrogram(
 // Regex (C++):
 // R"('s|'t|'re|'ve|'m|'ll|'d| ?[[:alpha:]]+| ?[[:digit:]]+| ?[^\s[:alpha:][:digit:]]+|\s+(?!\S)|\s+)"
 //
-static std::vector<whisper_vocab::id> tokenize(const whisper_vocab & vocab, const std::string & text) {
+static std::vector<whisper_vocab::id> tokenize_bpe(const whisper_vocab & vocab, const std::string & text) {
     std::vector<std::string> words;
 
     // first split the text into words
@@ -3333,6 +3625,14 @@ static std::vector<whisper_vocab::id> tokenize(const whisper_vocab & vocab, cons
     }
 
     return tokens;
+}
+
+// General tokenization function that dispatches to the appropriate tokenizer
+static std::vector<whisper_vocab::id> tokenize(const whisper_vocab & vocab, const std::string & text, e_model model_type) {
+    if (model_type == MODEL_MARIAN) {
+        return tokenize_sentencepiece(vocab, text);
+    }
+    return tokenize_bpe(vocab, text);
 }
 
 //
@@ -3485,8 +3785,8 @@ struct whisper_state * whisper_init_state(whisper_context * ctx) {
 
     state->decoders[0].rng = std::mt19937(0);
 
-    // conv allocator
-    {
+    // conv allocator - skip for Marian models since they don't have conv layers
+    if (ctx->model.type != MODEL_MARIAN) {
         bool ok = whisper_sched_graph_init(state->sched_conv, state->backends,
                 [&]() {
                     return whisper_build_graph_conv(*ctx, *state);
@@ -3499,10 +3799,12 @@ struct whisper_state * whisper_init_state(whisper_context * ctx) {
         }
 
         WHISPER_LOG_INFO("%s: compute buffer (conv)   = %7.2f MB\n", __func__, whisper_sched_size(state->sched_conv) / 1e6);
+    } else {
+        WHISPER_LOG_INFO("%s: skipping conv allocator for Marian model\n", __func__);
     }
 
-    // encoder allocator
-    if (!whisper_encode_external(*state)) {
+    // encoder allocator - skip for Marian models for now
+    if (!whisper_encode_external(*state) && ctx->model.type != MODEL_MARIAN) {
         bool ok = whisper_sched_graph_init(state->sched_encode, state->backends,
                 [&]() {
                     return whisper_build_graph_encoder(*ctx, *state);
@@ -3515,10 +3817,12 @@ struct whisper_state * whisper_init_state(whisper_context * ctx) {
         }
 
         WHISPER_LOG_INFO("%s: compute buffer (encode) = %7.2f MB\n", __func__, whisper_sched_size(state->sched_encode) / 1e6);
+    } else if (ctx->model.type == MODEL_MARIAN) {
+        WHISPER_LOG_INFO("%s: skipping encoder allocator for Marian model\n", __func__);
     }
 
-    // cross allocator
-    {
+    // cross allocator - skip for Marian models for now  
+    if (ctx->model.type != MODEL_MARIAN) {
         bool ok = whisper_sched_graph_init(state->sched_cross, state->backends,
                 [&]() {
                     return whisper_build_graph_cross(*ctx, *state);
@@ -3531,10 +3835,12 @@ struct whisper_state * whisper_init_state(whisper_context * ctx) {
         }
 
         WHISPER_LOG_INFO("%s: compute buffer (cross)  = %7.2f MB\n", __func__, whisper_sched_size(state->sched_cross) / 1e6);
+    } else {
+        WHISPER_LOG_INFO("%s: skipping cross allocator for Marian model\n", __func__);
     }
 
-    // decoder allocator
-    {
+    // decoder allocator - skip for Marian models for now
+    if (ctx->model.type != MODEL_MARIAN) {
         bool ok = whisper_sched_graph_init(state->sched_decode, state->backends,
                 [&]() {
                     const auto & hparams = ctx->model.hparams;
@@ -3555,6 +3861,8 @@ struct whisper_state * whisper_init_state(whisper_context * ctx) {
         }
 
         WHISPER_LOG_INFO("%s: compute buffer (decode) = %7.2f MB\n", __func__, whisper_sched_size(state->sched_decode) / 1e6);
+    } else {
+        WHISPER_LOG_INFO("%s: skipping decoder allocator for Marian model\n", __func__);
     }
 
     return state;
@@ -3971,7 +4279,7 @@ int whisper_decode(struct whisper_context * ctx, const whisper_token * tokens, i
 }
 
 int whisper_tokenize(struct whisper_context * ctx, const char * text, whisper_token * tokens, int n_max_tokens) {
-    const auto res = tokenize(ctx->vocab, text);
+    const auto res = tokenize(ctx->vocab, text, ctx->model.type);
 
     if (n_max_tokens < (int) res.size()) {
         WHISPER_LOG_ERROR("%s: too many resulting tokens: %d (max %d)\n", __func__, (int) res.size(), n_max_tokens);
@@ -4177,6 +4485,8 @@ const char *whisper_model_type_readable(struct whisper_context * ctx) {
         return "medium";
     case e_model::MODEL_LARGE:
         return "large";
+    case e_model::MODEL_MARIAN:
+        return "marian";
     default:
         return "unknown";
     }
@@ -7119,7 +7429,7 @@ int whisper_full_with_state(
                 if (!whisper_decode_internal(*ctx, *state, state->batch, params.n_threads, false, params.abort_callback, params.abort_callback_user_data)) {
                     WHISPER_LOG_ERROR("%s: failed to decode\n", __func__);
                     return -8;
-                }
+}
 
                 // Calculate no_speech probability after first decode.
                 // This has to be done before any logit filtering. Hence we cannot use the probs from the whisper_process_logits.
@@ -7461,7 +7771,7 @@ int whisper_full_with_state(
 
                         if (n_threads == 1) {
                             process();
-                        } else {
+                    } else {
                             std::vector<std::thread> threads(n_threads - 1);
 
                             for (int t = 0; t < n_threads - 1; ++t) {
@@ -7601,7 +7911,7 @@ int whisper_full_with_state(
                             if (params.print_realtime) {
                                 if (params.print_timestamps) {
                                     printf("[%s --> %s]  %s\n", to_timestamp(tt0).c_str(), to_timestamp(tt1).c_str(), text.c_str());
-                                } else {
+                    } else {
                                     printf("%s", text.c_str());
                                     fflush(stdout);
                                 }
@@ -7648,7 +7958,7 @@ int whisper_full_with_state(
                     if (params.print_realtime) {
                         if (params.print_timestamps) {
                             printf("[%s --> %s]  %s\n", to_timestamp(tt0).c_str(), to_timestamp(tt1).c_str(), text.c_str());
-                        } else {
+                    } else {
                             printf("%s", text.c_str());
                             fflush(stdout);
                         }
@@ -7705,13 +8015,13 @@ int whisper_full_with_state(
 
             WHISPER_LOG_DEBUG("seek = %d, seek_delta = %d\n", seek, seek_delta);
         }
-    }
+                    }
 
-    return 0;
-}
+                    return 0;
+                }
 
 int whisper_full(
-        struct whisper_context * ctx,
+                        struct whisper_context * ctx,
     struct whisper_full_params   params,
                    const float * samples,
                            int   n_samples) {

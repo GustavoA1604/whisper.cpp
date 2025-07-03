@@ -135,6 +135,10 @@ if (WHISPER_OPENVINO)
     target_link_libraries(whisper PRIVATE whisper.openvino)
 endif()
 
+target_compile_definitions(whisper PRIVATE WHISPER_USE_SENTENCEPIECE)
+target_include_directories(whisper PRIVATE ${SENTENCEPIECE_INCLUDE_DIRS})
+target_link_libraries(whisper PRIVATE ${SENTENCEPIECE_LIBRARIES})
+
 if (WHISPER_MKL)
     target_link_libraries(whisper PRIVATE MKL::MKL)
 endif()

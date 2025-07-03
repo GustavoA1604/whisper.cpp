@@ -124,6 +124,32 @@ if (GGML_CUDA AND NOT MSVC)
     add_compile_options(-Wno-deprecated-gpu-targets)
 endif()
 
+# SentencePiece support for Marian models (required)
+# Always search manually to get full library paths
+find_path(SENTENCEPIECE_INCLUDE_DIR 
+    NAMES sentencepiece_processor.h
+    PATHS /usr/local/include /usr/include
+    PATH_SUFFIXES sentencepiece
+)
+
+find_library(SENTENCEPIECE_LIBRARY 
+    NAMES sentencepiece
+    PATHS /usr/local/lib /usr/lib /usr/local/lib64 /usr/lib64
+)
+
+# For Marian inference, we only need the main sentencepiece library
+# The sentencepiece_train library is only needed for training, not inference
+if(SENTENCEPIECE_INCLUDE_DIR AND SENTENCEPIECE_LIBRARY)
+    set(SENTENCEPIECE_FOUND TRUE)
+    set(SENTENCEPIECE_INCLUDE_DIRS ${SENTENCEPIECE_INCLUDE_DIR})
+    set(SENTENCEPIECE_LIBRARIES ${SENTENCEPIECE_LIBRARY})
+    message(STATUS "Found SentencePiece")
+    message(STATUS "SentencePiece Include: ${SENTENCEPIECE_INCLUDE_DIRS}")  
+    message(STATUS "SentencePiece Library: ${SENTENCEPIECE_LIBRARIES}")
+else()
+    message(FATAL_ERROR "SentencePiece not found. Please verify installation.")
+endif()
+
 #
 # build the library
 #
