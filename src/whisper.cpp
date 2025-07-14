@@ -37,7 +37,8 @@
 #include <string>
 #include <thread>
 #include <vector>
-
+#include <iostream>
+#include <iomanip>
 // Fallback version if not defined by CMake
 #ifndef WHISPER_VERSION
 #define WHISPER_VERSION "unknown"
@@ -651,6 +652,7 @@ struct whisper_hparams {
     int32_t n_src_vocab   = 0;    // Source vocabulary size for Marian translation
     int32_t n_tgt_vocab   = 0;    // Target vocabulary size for Marian translation
     int32_t n_max_seq_len = 512;  // Maximum sequence length for Marian
+    int32_t d_model = 512;
 };
 
 // audio encoding layer
@@ -669,6 +671,7 @@ struct whisper_layer_encoder {
 
     // encoder.blocks.*.attn.key
     struct ggml_tensor * attn_k_w;
+    struct ggml_tensor * attn_k_b;
 
     // encoder.blocks.*.attn.value
     struct ggml_tensor * attn_v_w;
@@ -938,6 +941,9 @@ struct whisper_state {
     whisper_sched sched_decode;
 
     // result of the encoder
+
+    struct ggml_tensor * input_embeddings = nullptr;
+    struct ggml_tensor * debug_tensor = nullptr;
     struct ggml_tensor * embd_conv = nullptr;
     struct ggml_tensor * embd_enc  = nullptr;
 
@@ -992,13 +998,16 @@ struct whisper_state {
     bool has_vad_segments = false;
 
     std::vector<vad_time_mapping> vad_mapping_table;
+
+    // Marian stuff
+    std::vector<whisper_token> text_tokens;
 };
 
 struct whisper_context {
     int64_t t_load_us  = 0;
     int64_t t_start_us = 0;
 
-    ggml_type wtype = ggml_type::GGML_TYPE_F16; // weight type (FP32 / FP16 / QX)
+    ggml_type wtype = ggml_type::GGML_TYPE_F32; // weight type (FP32 / FP16 / QX)
     ggml_type itype = ggml_type::GGML_TYPE_F16; // intermediate type (FP32 or FP16)
 
     whisper_context_params params;
@@ -1555,8 +1564,8 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
         auto & hparams = model.hparams;
 
         read_safe(loader, hparams.n_vocab);
-        read_safe(loader, hparams.n_audio_ctx);
-        read_safe(loader, hparams.n_audio_state);
+        read_safe(loader, hparams.n_audio_ctx);   
+        read_safe(loader, hparams.n_audio_state); // for marian d_model
         read_safe(loader, hparams.n_audio_head);
         read_safe(loader, hparams.n_audio_layer);
         read_safe(loader, hparams.n_text_ctx);
@@ -1886,7 +1895,7 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
                 layer.attn_q_b = ggml_dup_tensor(marian_ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_audio_state));
                 layer.attn_k_w = ggml_dup_tensor(marian_ctx, ggml_new_tensor_2d(ctx, wtype, n_audio_state, n_audio_state));
                 // Create k_proj bias tensor even though it might be unused in standard Marian
-                ggml_tensor * attn_k_b = ggml_dup_tensor(marian_ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_audio_state));
+                layer.attn_k_b = ggml_dup_tensor(marian_ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_audio_state));
                 layer.attn_v_w = ggml_dup_tensor(marian_ctx, ggml_new_tensor_2d(ctx, wtype, n_audio_state, n_audio_state));
                 layer.attn_v_b = ggml_dup_tensor(marian_ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_audio_state));
                 layer.attn_ln_1_w = ggml_dup_tensor(marian_ctx, ggml_new_tensor_2d(ctx, wtype, n_audio_state, n_audio_state));
@@ -1904,7 +1913,7 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
                 model.tensors[format("encoder.layers.%d.self_attn.q_proj.weight", i)] = layer.attn_q_w;
                 model.tensors[format("encoder.layers.%d.self_attn.q_proj.bias", i)] = layer.attn_q_b;
                 model.tensors[format("encoder.layers.%d.self_attn.k_proj.weight", i)] = layer.attn_k_w;
-                model.tensors[format("encoder.layers.%d.self_attn.k_proj.bias", i)] = attn_k_b;
+                model.tensors[format("encoder.layers.%d.self_attn.k_proj.bias", i)] = layer.attn_k_b;
                 model.tensors[format("encoder.layers.%d.self_attn.v_proj.weight", i)] = layer.attn_v_w;
                 model.tensors[format("encoder.layers.%d.self_attn.v_proj.bias", i)] = layer.attn_v_b;
                 model.tensors[format("encoder.layers.%d.self_attn.out_proj.weight", i)] = layer.attn_ln_1_w;
@@ -1915,8 +1924,7 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
                 model.tensors[format("encoder.layers.%d.fc1.bias", i)] = layer.mlp_0_b;
                 model.tensors[format("encoder.layers.%d.fc2.weight", i)] = layer.mlp_1_w;
                 model.tensors[format("encoder.layers.%d.fc2.bias", i)] = layer.mlp_1_b;
-            } else {
-                // Standard Whisper encoder layers
+            } else { // Standard Whisper encoder layers
                 layer.mlp_ln_w = create_tensor(ASR_TENSOR_MLP_LN_WEIGHT, ASR_SYSTEM_ENCODER, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_audio_state), i);
                 layer.mlp_ln_b = create_tensor(ASR_TENSOR_MLP_LN_BIAS, ASR_SYSTEM_ENCODER, ggml_new_tensor_1d(ctx, GGML_TYPE_F32,   n_audio_state), i);
 
@@ -2076,7 +2084,7 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
             // Create meta tensors that will be allocated later with proper backend
             ggml_tensor * meta_encoder_emb = ggml_new_tensor_2d(ctx, wtype, n_text_state, n_vocab);
             ggml_tensor * meta_decoder_emb = ggml_new_tensor_2d(ctx, wtype, n_text_state, n_vocab);
-            ggml_tensor * meta_enc_pos_emb = ggml_new_tensor_2d(ctx, wtype, n_text_state, n_text_ctx);  // Shape: (512, 512) 
+            ggml_tensor * meta_enc_pos_emb = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_text_state, n_text_ctx);  // Shape: (512, 512) 
             ggml_tensor * meta_dec_pos_emb = ggml_new_tensor_2d(ctx, wtype, n_text_state, n_text_ctx);  // Shape: (512, 512)
             ggml_tensor * meta_enc_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state);
             ggml_tensor * meta_enc_norm_b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state);
@@ -2099,7 +2107,6 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
             model.m_decoder_norm_b = ggml_dup_tensor(marian_ctx, meta_dec_norm_b);
             model.m_lm_head_w = ggml_dup_tensor(marian_ctx, meta_lm_head);
             model.m_final_logits_bias = ggml_dup_tensor(marian_ctx, meta_final_logits_bias);
-            
             // Map to tensor names from conversion script
             model.tensors["encoder.embeddings.weight"] = model.m_encoder_embeddings;
             model.tensors["decoder.embeddings.weight"] = model.m_decoder_embeddings;
@@ -2320,7 +2327,7 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
     const int n_state = hparams.n_audio_state;
     const int n_head  = hparams.n_audio_head;
     const int n_layer = hparams.n_audio_layer;
-
+    const float embed_scaling = std::sqrt(hparams.d_model);
     const int n_state_head = n_state/n_head;
 
     auto & kv_pad = wstate.kv_pad;
@@ -2334,12 +2341,27 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
         /*.mem_buffer =*/ wstate.sched_encode.meta.data(),
         /*.no_alloc   =*/ true,
     };
-
+  
     struct ggml_context * ctx0 = ggml_init(params);
 
     ggml_cgraph * gf = ggml_new_graph_custom(ctx0, WHISPER_MAX_NODES, false);
+    struct ggml_tensor * cur = nullptr;
+    if (model.type == MODEL_MARIAN)
+    {
+      if (wstate.text_tokens.size() == 0)
+      {
+        wstate.text_tokens.resize(7);
+      }
+      struct ggml_tensor* indices = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, wstate.text_tokens.size());
+      ggml_set_name(indices, "token_ids");
+      ggml_set_input(indices);
 
-    struct ggml_tensor * cur = ggml_view_tensor(ctx0, wstate.embd_conv);
+      cur = ggml_get_rows(ctx0, wctx.model.m_encoder_embeddings, indices);
+      cur = ggml_scale(ctx0, cur, embed_scaling);
+    }
+    else {
+      cur = ggml_view_tensor(ctx0, wstate.embd_conv);
+    }
 
     const float KQscale = 1.0f/sqrtf(float(n_state_head));
 
@@ -2356,15 +2378,24 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
     //}
 
     static int iter = 0;
-
-    const size_t e_pe_stride = model.e_pe->ne[0]*ggml_element_size(model.e_pe);
-    const size_t e_pe_offset = model.e_pe->ne[0]*ggml_element_size(model.e_pe)*n_ctx*iter;
-
-    struct ggml_tensor * e_pe = ggml_view_2d(ctx0, model.e_pe, model.e_pe->ne[0], n_ctx, e_pe_stride, e_pe_offset);
-    cur = ggml_add(ctx0, e_pe, ggml_cont(ctx0, ggml_transpose(ctx0, cur)));
+    if (model.type != MODEL_MARIAN){
+        const size_t e_pe_stride = model.e_pe->ne[0]*ggml_element_size(model.e_pe);
+        const size_t e_pe_offset = model.e_pe->ne[0]*ggml_element_size(model.e_pe)*n_ctx*iter;
+    
+        struct ggml_tensor * e_pe = ggml_view_2d(ctx0, model.e_pe, model.e_pe->ne[0], n_ctx, e_pe_stride, e_pe_offset);
+    
+        cur = ggml_add(ctx0, e_pe, ggml_cont(ctx0, ggml_transpose(ctx0, cur)));
+    }
+    // positional embeddings for Marian 
+    else 
+    {
+       const size_t e_pe_stride = model.m_encoder_pos_emb->ne[0]*ggml_element_size(model.m_encoder_pos_emb);
+       struct ggml_tensor* encoder_pos_emb = ggml_view_2d(ctx0, model.m_encoder_pos_emb, model.m_encoder_pos_emb->ne[0], wstate.text_tokens.size(), e_pe_stride, 0);
+       ggml_tensor* temp = ggml_cont(ctx0, encoder_pos_emb);
+       cur = ggml_add(ctx0, cur, temp);
+    }
 
     // ===================================================================
-
     // original:
     //cur = ggml_add(ctx0, model.e_pe, ggml_transpose(ctx0, cur));
 
@@ -2373,6 +2404,7 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers_encoder[il];
 
+        if (model.type != MODEL_MARIAN)
         // norm
         {
             cur = ggml_norm(ctx0, inpL, hparams.eps);
@@ -2388,16 +2420,19 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
             struct ggml_tensor * Qcur = ggml_mul_mat(ctx0,
                     layer.attn_q_w,
                     cur);
-
             Qcur = ggml_add(ctx0, Qcur, layer.attn_q_b);
-
             //Qcur = ggml_scale(ctx0, Qcur, pow(float(n_state_head), -0.25));
 
             // note: no bias for Key
             struct ggml_tensor * Kcur = ggml_mul_mat(ctx0,
                     layer.attn_k_w,
                     cur);
-
+            if (model.type == MODEL_MARIAN)
+            {
+               Kcur = ggml_add(ctx0, Kcur, layer.attn_k_b);
+            }
+            
+            
             //Kcur = ggml_scale(ctx0, Kcur, pow(float(n_state_head), -0.25));
 
             struct ggml_tensor * Vcur = ggml_mul_mat(ctx0,
@@ -2405,14 +2440,26 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
                     cur);
 
             Vcur = ggml_add(ctx0, Vcur, layer.attn_v_b);
-
+            
+            
             // ------
-
-            struct ggml_tensor * Q =
-                ggml_permute(ctx0,
+            struct ggml_tensor * Q = nullptr;
+            if (model.type != MODEL_MARIAN){
+              Q =  ggml_permute(ctx0,                                                          // n_ctx == 1500 changing this to wstate.text_tokens.size() for Marian 
+                                                                                                    // Need to investigate and see what should be the value of this 
+                                                                                                    // for a while translation pipeline.
                         ggml_reshape_3d(ctx0, Qcur, n_state_head, n_head, n_ctx),
                         0, 2, 1, 3);
-
+            }
+            else
+            {
+              Q =  ggml_permute(ctx0,                                                               // n_ctx == 1500 changing this to wstate.text_tokens.size() for Marian 
+                                                                                                    // Need to investigate and see what should be the value of this 
+                                                                                                    // for a while translation pipeline.
+                        ggml_reshape_3d(ctx0, Qcur, n_state_head, n_head, wstate.text_tokens.size()),
+                        0, 2, 1, 3);
+ 
+            }
             if (wctx.params.flash_attn) {
                 ggml_build_forward_expand(gf, ggml_cpy(ctx0, Kcur, ggml_view_1d(ctx0, kv_pad.k, n_ctx*n_state, 0)));
                 ggml_build_forward_expand(gf, ggml_cpy(ctx0, Vcur, ggml_view_1d(ctx0, kv_pad.v, n_ctx*n_state, 0)));
@@ -2435,35 +2482,65 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
 
                 cur = ggml_reshape_2d(ctx0, cur, n_state, n_ctx);
             } else {
-                struct ggml_tensor * K =
-                    ggml_permute(ctx0,
+                struct ggml_tensor * K = nullptr;
+                if ( model.type != MODEL_MARIAN)
+                {
+                    K = ggml_permute(ctx0,
                             ggml_cast(ctx0,
                                 ggml_reshape_3d(ctx0, Kcur, n_state_head, n_head, n_ctx),
                                 wctx.itype),
                             0, 2, 1, 3);
-
-                // K * Q
+                }
+                else
+                {
+                    K = ggml_permute(ctx0,
+                            ggml_cast(ctx0,
+                                ggml_reshape_3d(ctx0, Kcur, n_state_head, n_head, wstate.text_tokens.size()),
+                                wctx.itype),
+                            0, 2, 1, 3);
+ 
+                }
+    // K * Q
                 struct ggml_tensor * KQ = ggml_mul_mat(ctx0, K, Q);
 
                 struct ggml_tensor * KQ_soft_max = ggml_soft_max_ext(ctx0, KQ, nullptr, KQscale, 0.0f);
 
-                struct ggml_tensor * V =
-                    ggml_cast(ctx0,
+                struct ggml_tensor * V = nullptr;
+                if (model.type != MODEL_MARIAN) {
+                    V = ggml_cast(ctx0,
                             ggml_permute(ctx0,
                                 ggml_reshape_3d(ctx0,
                                     Vcur,
                                     n_state_head, n_head, n_ctx),
                                 1, 2, 0, 3),
                             wctx.itype);
+                }
+                else
+                {
+                    V = ggml_cast(ctx0,
+                            ggml_permute(ctx0,
+                                ggml_reshape_3d(ctx0,
+                                    Vcur,
+                                    n_state_head, n_head, wstate.text_tokens.size()),
+                                1, 2, 0, 3),
+                            wctx.itype);
+                }
 
                 struct ggml_tensor * KQV = ggml_mul_mat(ctx0, V, KQ_soft_max);
 
                 struct ggml_tensor * KQV_merged = ggml_permute(ctx0, KQV, 0, 2, 1, 3);
 
-                cur = ggml_cont_2d(ctx0, KQV_merged, n_state, n_ctx);
+                if ( model.type != MODEL_MARIAN )
+                {
+                  cur = ggml_cont_2d(ctx0, KQV_merged, n_state, n_ctx);
+                }
+                else 
+                {
+                  cur = ggml_cont_2d(ctx0, KQV_merged, n_state, wstate.text_tokens.size());
+                }
             }
         }
-
+        
         // projection
         {
             cur = ggml_mul_mat(ctx0,
@@ -2471,13 +2548,14 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
                     cur);
 
             cur = ggml_add(ctx0, cur, layer.attn_ln_1_b);
-        }
+
+       }
 
         // add the input
         cur = ggml_add(ctx0, cur, inpL);
 
         struct ggml_tensor * inpFF = cur;
-
+        struct ggml_tensor * residual = nullptr;
         // feed-forward network
         {
             // norm
@@ -2485,9 +2563,21 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
                 cur = ggml_norm(ctx0, inpFF, hparams.eps);
 
                 // cur = mlp_ln_w*cur + mlp_ln_b
-                cur = ggml_add(ctx0,
+                if (model.type != MODEL_MARIAN) 
+                {
+                  cur = ggml_add(ctx0,
                         ggml_mul(ctx0, cur, layer.mlp_ln_w),
                         layer.mlp_ln_b);
+ 
+                }
+                else 
+                {
+                  cur = ggml_add(ctx0,
+                        ggml_mul(ctx0, cur, layer.attn_ln_0_w),
+                        layer.attn_ln_0_b);
+
+                  residual = cur;
+                }
             }
 
             // fully connected
@@ -2498,33 +2588,63 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
             cur = ggml_add(ctx0, cur, layer.mlp_0_b);
 
             // GELU activation
-            cur = ggml_gelu(ctx0, cur);
-
+            if (model.type != MODEL_MARIAN)
+            {
+              cur = ggml_gelu(ctx0, cur);
+            }
+            else
+            {
+              cur = ggml_silu(ctx0, cur);
+            }
+            
             // projection
             cur = ggml_mul_mat(ctx0,
                     layer.mlp_1_w,
                     cur);
 
             cur = ggml_add(ctx0, cur, layer.mlp_1_b);
-        }
 
+            if (model.type == MODEL_MARIAN) 
+            {
+              // residual connection
+              cur = ggml_add(ctx0, cur, residual);
+
+              // LayerNorm
+              cur = ggml_norm(ctx0, cur, hparams.eps);
+
+              cur = ggml_add(ctx0,
+                     ggml_mul(ctx0, cur, layer.mlp_ln_w),
+                     layer.mlp_ln_b);
+            }
+       }
+       if (model.type != MODEL_MARIAN)
+       {
         inpL = ggml_add(ctx0, cur, inpFF);
+       }
+       else 
+       {
+         inpL = cur;
+       }
+
     }
 
     cur = inpL;
 
     // norm
     {
-        cur = ggml_norm(ctx0, cur, hparams.eps);
-
-        // cur = ln_f_g*cur + ln_f_b
-        cur = ggml_add(ctx0,
-                ggml_mul(ctx0, cur, model.e_ln_w),
-                model.e_ln_b);
+        if (model.type != MODEL_MARIAN)
+        {
+             cur = ggml_norm(ctx0, cur, hparams.eps);
+        
+             // cur = ln_f_g*cur + ln_f_b
+             cur = ggml_add(ctx0,
+                     ggml_mul(ctx0, cur, model.e_ln_w),
+                     model.e_ln_b);
+        }
     }
 
     ggml_build_forward_expand(gf, cur);
-
+    wstate.debug_tensor = cur;
     wstate.embd_enc = cur;
 
     //ggml_graph_print(gf);
@@ -2618,6 +2738,36 @@ static struct ggml_cgraph * whisper_build_graph_cross(
     ggml_free(ctx0);
 
     return gf;
+}
+static bool marian_encode_internal(
+        whisper_context & wctx,
+          whisper_state & wstate){
+
+    wstate.text_tokens.push_back(0);
+    auto & sched = wstate.sched_encode.sched;
+    ggml_cgraph* gf = whisper_build_graph_encoder(wctx, wstate);
+    if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+        // should never happen as we pre-allocate the memory
+        return false;
+    }
+    
+    // set the input
+    ggml_tensor* indices = ggml_graph_get_tensor(gf, "token_ids");
+    ggml_backend_tensor_set(indices, wstate.text_tokens.data(), 0, ggml_nbytes(indices));
+
+    // hardcoded n_threads to 4 
+    if (!ggml_graph_compute_helper(sched, gf, 4)) {
+    std::cout<<"Failed to compute the encoder graph"<<std::endl;
+      return false;
+    }
+    std::vector<float> buffer(10);
+    ggml_backend_tensor_get(wstate.debug_tensor, buffer.data(), 0, ggml_nbytes(wstate.debug_tensor));
+    for (auto&& el : buffer)
+    {
+       std::cout<<std::setprecision(4)<<el<<" ";
+    }
+    std::cout.flush();
+    return true;
 }
 
 // evaluate the encoder with the given state
@@ -2797,7 +2947,7 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
 
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers_decoder[il];
-
+        if ( model.type != MODEL_MARIAN)
         // norm
         {
             cur = ggml_norm(ctx0, inpL, hparams.eps);
@@ -2820,14 +2970,19 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
                         Qcur,
                         layer.attn_q_b);
 
-            Qcur = ggml_scale(ctx0, Qcur, KQscale);
+            if ( model.type != MODEL_MARIAN)
+            {
+              Qcur = ggml_scale(ctx0, Qcur, KQscale);
+            }
 
             // note: no bias for Key
             struct ggml_tensor * Kcur = ggml_mul_mat(ctx0,
                     layer.attn_k_w,
                     cur);
-
-            Kcur = ggml_scale(ctx0, Kcur, KQscale);
+            if (model.type != MODEL_MARIAN)
+            {
+              Kcur = ggml_scale(ctx0, Kcur, KQscale);
+            }
 
             // store key and value to memory
             {
@@ -3803,12 +3958,12 @@ struct whisper_state * whisper_init_state(whisper_context * ctx) {
         WHISPER_LOG_INFO("%s: skipping conv allocator for Marian model\n", __func__);
     }
 
-    // encoder allocator - skip for Marian models for now
-    if (!whisper_encode_external(*state) && ctx->model.type != MODEL_MARIAN) {
+    // encoder allocator
+    if (!whisper_encode_external(*state)) {
         bool ok = whisper_sched_graph_init(state->sched_encode, state->backends,
                 [&]() {
                     return whisper_build_graph_encoder(*ctx, *state);
-                });
+});
 
         if (!ok) {
             WHISPER_LOG_ERROR("%s: failed to init encoder allocator\n", __func__);
@@ -4255,6 +4410,17 @@ int whisper_encode(struct whisper_context * ctx, int offset, int n_threads) {
 
     return 0;
 }
+
+int marian_encode(struct whisper_context * ctx)
+{
+  if (!marian_encode_internal(*ctx, *ctx->state)){
+        WHISPER_LOG_ERROR("%s: failed to eval\n", __func__);
+        return -1;
+  }
+
+  return 0;
+}
+
 
 int whisper_decode_with_state(struct whisper_context * ctx, struct whisper_state * state, const whisper_token * tokens, int n_tokens, int n_past, int n_threads) {
     whisper_batch_prep_legacy(state->batch, tokens, n_tokens, n_past, 0);
@@ -7100,7 +7266,42 @@ static bool whisper_vad(
     }
 
     return true;
+}    
+
+int marian_full(struct whisper_context * ctx,
+                const char* input_text) {
+    ctx->state->result_all.clear();
+
+    int n_tokens = whisper_token_count(ctx, input_text);
+    ctx->state->text_tokens.resize(n_tokens);
+
+    int actual_tokens = whisper_tokenize(ctx, input_text, ctx->state->text_tokens.data(), n_tokens);
+    if (actual_tokens > 0) {
+            std::cout << "Tokenization successful!" << std::endl;
+            std::cout << "Tokens: ";
+            for (int i = 0; i < actual_tokens; i++) {
+                std::cout << ctx->state->text_tokens[i];
+                if (i < actual_tokens - 1) std::cout << ", ";
+            }
+            std::cout << std::endl;
+            
+            std::cout << "Token strings: ";
+            for (int i = 0; i < actual_tokens; i++) {
+                const char* token_str = whisper_token_to_str(ctx, ctx->state->text_tokens[i]);
+                std::cout << "\"" << (token_str ? token_str : "<null>") << "\"";
+                if (i < actual_tokens - 1) std::cout << ", ";
+            }
+            std::cout << std::endl;
+        } else {
+            std::cout << "Tokenization failed!" << std::endl;
+        }
+
+
+
+    // encoder 
+    return marian_encode_internal(*ctx, *ctx->state);
 }
+     
 
 int whisper_full_with_state(
         struct whisper_context * ctx,
