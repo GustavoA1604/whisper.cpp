@@ -2741,8 +2741,9 @@ static struct ggml_cgraph * whisper_build_graph_cross(
 }
 static bool marian_encode_internal(
         whisper_context & wctx,
-          whisper_state & wstate){
-
+          whisper_state & wstate)
+{
+    // Done for debug purposes to have a match with python input frame.
     wstate.text_tokens.push_back(0);
     auto & sched = wstate.sched_encode.sched;
     ggml_cgraph* gf = whisper_build_graph_encoder(wctx, wstate);
