@@ -318,6 +318,9 @@ extern "C" {
                                int   offset,
                                int   n_threads);
 
+    WHISPER_API int marian_encode(
+            struct whisper_context * ctx);
+
     // Run the Whisper decoder to obtain the logits and probabilities for the next token.
     // Make sure to call whisper_encode() first.
     // tokens + n_tokens is the provided context for the decoder.
@@ -596,6 +599,10 @@ extern "C" {
     WHISPER_API struct whisper_full_params * whisper_full_default_params_by_ref(enum whisper_sampling_strategy strategy);
     WHISPER_API struct whisper_full_params   whisper_full_default_params       (enum whisper_sampling_strategy strategy);
 
+
+    WHISPER_API int marian_full(struct whisper_context * ctx,
+                                const char* input_text);
+                                
     // Run the entire model: PCM -> log mel spectrogram -> encoder -> decoder -> text
     // Not thread safe for same context
     // Uses the specified decoding strategy to obtain the text.
