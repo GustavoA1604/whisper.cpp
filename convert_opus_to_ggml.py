@@ -72,14 +72,16 @@ def write_tensor(fout, name: str, data: np.ndarray, use_f16: bool = True):
     """Write a single tensor in GGML format."""
     n_dims = len(data.shape)
     
-    if use_f16 and n_dims >= 2 and "bias" not in name and "layer_norm" not in name:
+    if use_f16 and n_dims >= 2 and "bias" not in name and "layer_norm" not in name and name != "encoder.embed_positions.weight":
         data = data.astype(np.float16)
         ftype = 1
+        ftype_string = "fp16"
     else:
         data = data.astype(np.float32)
         ftype = 0
+        ftype_string = "fp32"
     
-    print(f"Writing tensor: {name} {list(data.shape)} (ftype={ftype})")
+    print(f"Writing tensor: {name} {list(data.shape)} (ftype={ftype_string})")
     
     name_bytes = name.encode('utf-8')
     fout.write(struct.pack("iii", n_dims, len(name_bytes), ftype))
@@ -230,6 +232,7 @@ def convert_marian_to_ggml(model_path: Path, output_path: Path, use_f16: bool = 
             
             ggml_name = convert_tensor_name(name)
             
+            print("Tensor : {0} is {1}".format(ggml_name,tensor.dtype))
             if tensor.dtype == torch.float16:
                 np_tensor = tensor.to(torch.float32).numpy()
             else:

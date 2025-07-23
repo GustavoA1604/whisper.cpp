@@ -2963,7 +2963,7 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
       ggml_set_name(input_ids, "input_ids");
       ggml_set_input(input_ids);
 
-      encoder_output = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 512, 7, 1);
+      encoder_output = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 512, wstate.text_tokens.size(), 1);
       ggml_set_name(encoder_output, "encoder_output");
       ggml_set_input(encoder_output);
     }

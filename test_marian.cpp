@@ -31,39 +31,30 @@ int main(int argc, char* argv[]) {
     std::cout << "Model type: " << whisper_model_type_readable(ctx) << std::endl;
     std::cout << "Vocab size: " << whisper_model_n_vocab(ctx) << std::endl;
     
-    // Test tokenization
-    std::cout << "\nTesting tokenization..." << std::endl;
+    // Run full Marian translation pipeline
+    std::cout << "\nRunning Marian translation..." << std::endl;
     std::cout << "Input text: \"" << input_text << "\"" << std::endl;
     
-    int n_tokens = whisper_token_count(ctx, input_text);
-    std::cout << "Number of tokens: " << n_tokens << std::endl;
+    int result = marian_full(ctx, input_text);
     
-    if (n_tokens > 0) {
-        std::vector<whisper_token> tokens(n_tokens);
+    if (result == 0) {
+        std::cout << "\nTranslation completed successfully!" << std::endl;
         
-        int actual_tokens = whisper_tokenize(ctx, input_text, tokens.data(), n_tokens);
+        // Get the number of segments (results)
+        int n_segments = whisper_full_n_segments(ctx);
+        std::cout << "Number of segments: " << n_segments << std::endl;
         
-        if (actual_tokens > 0) {
-            std::cout << "Tokenization successful!" << std::endl;
-            std::cout << "Tokens: ";
-            for (int i = 0; i < actual_tokens; i++) {
-                std::cout << tokens[i];
-                if (i < actual_tokens - 1) std::cout << ", ";
-            }
-            std::cout << std::endl;
-            
-            std::cout << "Token strings: ";
-            for (int i = 0; i < actual_tokens; i++) {
-                const char* token_str = whisper_token_to_str(ctx, tokens[i]);
-                std::cout << "\"" << (token_str ? token_str : "<null>") << "\"";
-                if (i < actual_tokens - 1) std::cout << ", ";
-            }
-            std::cout << std::endl;
-        } else {
-            std::cout << "Tokenization failed!" << std::endl;
+        // Print each segment
+        for (int i = 0; i < n_segments; i++) {
+            const char* segment_text = whisper_full_get_segment_text(ctx, i);
+            std::cout << "Segment " << i << ": \"" << (segment_text ? segment_text : "<null>") << "\"" << std::endl;
         }
+    } else if (result == -1) {
+        std::cout << "Translation failed: Encoder error" << std::endl;
+    } else if (result == -2) {
+        std::cout << "Translation failed: Decoder error" << std::endl;
     } else {
-        std::cout << "No tokens generated!" << std::endl;
+        std::cout << "Translation failed with unknown error code: " << result << std::endl;
     }
     
     whisper_free(ctx);
