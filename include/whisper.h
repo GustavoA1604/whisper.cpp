@@ -602,6 +602,9 @@ extern "C" {
 
     WHISPER_API int marian_full(struct whisper_context * ctx,
                                 const char* input_text);
+
+    WHISPER_API int indictrans_full(struct whisper_context * ctx,
+                                   const char* input_text);
                                 
     // Run the entire model: PCM -> log mel spectrogram -> encoder -> decoder -> text
     // Not thread safe for same context
