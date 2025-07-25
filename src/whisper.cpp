@@ -35,6 +35,7 @@
 #include <random>
 #include <regex>
 #include <set>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -502,6 +503,11 @@ struct whisper_vocab {
     // SentencePiece processor for Marian models
     std::unique_ptr<sentencepiece::SentencePieceProcessor> sp_processor;
     bool has_sentencepiece = false;
+    
+    // IndicTrans2 dual SentencePiece processors
+    std::unique_ptr<sentencepiece::SentencePieceProcessor> indictrans_src_processor;
+    std::unique_ptr<sentencepiece::SentencePieceProcessor> indictrans_tgt_processor;
+    bool has_indictrans_tokenizers = false;
 
     bool is_multilingual() const {
         return n_vocab >= 51865;
@@ -1747,8 +1753,6 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
             WHISPER_LOG_INFO("%s: %s model detected - using complete vocabulary (%d tokens)\n", __func__, model_name, n_vocab);
             vocab.n_vocab = n_vocab;
             
-            vocab.sp_processor = std::make_unique<sentencepiece::SentencePieceProcessor>();
-            
             int32_t sp_model_size = 0;
             read_safe(loader, sp_model_size);
             
@@ -1757,18 +1761,54 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
                 loader->read(loader->context, sp_model_data.data(), sp_model_size);
                 
                 std::string serialized_model(sp_model_data.data(), sp_model_size);
-                auto status = vocab.sp_processor->LoadFromSerializedProto(serialized_model);
                 
-                if (status.ok()) {
-                    vocab.has_sentencepiece = true;
-                    WHISPER_LOG_INFO("%s: SentencePiece processor loaded from serialized model data (%d bytes)\n", __func__, sp_model_size);
+                if (model.type == MODEL_INDICTRANS) {
+                    // IndicTrans2: Initialize source processor (for now using the single model for both)
+                    WHISPER_LOG_INFO("%s: Initializing IndicTrans2 tokenizers...\n", __func__);
+                    
+                    vocab.indictrans_src_processor = std::make_unique<sentencepiece::SentencePieceProcessor>();
+                    vocab.indictrans_tgt_processor = std::make_unique<sentencepiece::SentencePieceProcessor>();
+                    
+                    // Load the source model (currently the conversion script only embeds the source model)
+                    auto src_status = vocab.indictrans_src_processor->LoadFromSerializedProto(serialized_model);
+                    
+                    if (src_status.ok()) {
+                        WHISPER_LOG_INFO("%s: IndicTrans2 source SentencePiece processor loaded (%d bytes)\n", __func__, sp_model_size);
+                        
+                        // For now, use the same model for target (this is a temporary solution)
+                        auto tgt_status = vocab.indictrans_tgt_processor->LoadFromSerializedProto(serialized_model);
+                        
+                        if (tgt_status.ok()) {
+                            vocab.has_indictrans_tokenizers = true;
+                            WHISPER_LOG_INFO("%s: IndicTrans2 target SentencePiece processor loaded (shared model)\n", __func__);
+                        } else {
+                            WHISPER_LOG_WARN("%s: Failed to load IndicTrans2 target processor: %s\n", __func__, tgt_status.ToString().c_str());
+                            vocab.has_indictrans_tokenizers = false;
+                        }
+                    } else {
+                        WHISPER_LOG_WARN("%s: Failed to load IndicTrans2 source processor: %s\n", __func__, src_status.ToString().c_str());
+                        vocab.has_indictrans_tokenizers = false;
+                    }
                 } else {
-                    WHISPER_LOG_WARN("%s: Failed to load SentencePiece processor from serialized data: %s\n", __func__, status.ToString().c_str());
-                    vocab.has_sentencepiece = false;
+                    // Marian: Use existing single processor
+                    vocab.sp_processor = std::make_unique<sentencepiece::SentencePieceProcessor>();
+                    auto status = vocab.sp_processor->LoadFromSerializedProto(serialized_model);
+                    
+                    if (status.ok()) {
+                        vocab.has_sentencepiece = true;
+                        WHISPER_LOG_INFO("%s: Marian SentencePiece processor loaded from serialized model data (%d bytes)\n", __func__, sp_model_size);
+                    } else {
+                        WHISPER_LOG_WARN("%s: Failed to load Marian SentencePiece processor from serialized data: %s\n", __func__, status.ToString().c_str());
+                        vocab.has_sentencepiece = false;
+                    }
                 }
             } else {
                 WHISPER_LOG_WARN("%s: No SentencePiece model data found in GGML file. SentencePiece tokenization will not be available.\n", __func__);
-                vocab.has_sentencepiece = false;
+                if (model.type == MODEL_INDICTRANS) {
+                    vocab.has_indictrans_tokenizers = false;
+                } else {
+                    vocab.has_sentencepiece = false;
+                }
             }
         } else {
             if (vocab.is_multilingual()) {
@@ -2467,8 +2507,7 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
 
       cur = ggml_get_rows(ctx0, wctx.model.m_encoder_embeddings, indices);
       cur = ggml_scale(ctx0, cur, embed_scaling);
-    }
-    else {
+    } else {
       cur = ggml_view_tensor(ctx0, wstate.embd_conv);
     }
 
@@ -4061,18 +4100,201 @@ static bool log_mel_spectrogram(
     return true;
 }
 
-// SentencePiece tokenization for translation models
-static std::vector<whisper_vocab::id> tokenize_sentencepiece(const whisper_vocab & vocab, const std::string & text) {
+// IndicTrans2 language code mappings
+static const std::unordered_map<std::string, std::string> indictrans_lang_codes = {
+    {"en", "eng_Latn"},
+    {"hi", "hin_Deva"}, 
+    {"bn", "ben_Beng"},
+    {"gu", "guj_Gujr"},
+    {"kn", "kan_Knda"},
+    {"ml", "mal_Mlym"},
+    {"mr", "mar_Deva"},
+    {"ne", "npi_Deva"},
+    {"or", "ory_Orya"},
+    {"pa", "pan_Guru"},
+    {"ta", "tam_Taml"},
+    {"te", "tel_Telu"},
+    {"ur", "urd_Arab"},
+    {"as", "asm_Beng"},
+    {"brx", "brx_Deva"},
+    {"doi", "doi_Deva"},
+    {"kas", "kas_Deva"}, // Kashmiri (Devanagari)
+    {"kok", "gom_Deva"}, // Konkani
+    {"mai", "mai_Deva"}, // Maithili
+    {"mni", "mni_Beng"}, // Manipuri (Bengali script)
+    {"sat", "sat_Olck"}, // Santali
+    {"sd", "snd_Deva"},  // Sindhi (Devanagari)
+    {"san", "san_Deva"} // Sanskrit
+};
+
+// IndicProcessor-style text preprocessing (adds spaces around punctuation)
+static std::string indictrans_preprocess_text(const std::string& text) {
+    std::string result = text;
+    
+    // Add spaces around punctuation (IndicProcessor behavior)
+    const std::vector<std::pair<std::string, std::string>> punctuation_rules = {
+        {",", " , "},
+        {".", " . "},
+        {"?", " ? "},
+        {"!", " ! "},
+        {";", " ; "},
+        {":", " : "},
+        {"(", " ( "},
+        {")", " ) "},
+        {"[", " [ "},
+        {"]", " ] "},
+        {"{", " { "},
+        {"}", " } "},
+        {"\"", " \" "},
+        {"'", " ' "}
+    };
+    
+    for (const auto& rule : punctuation_rules) {
+        size_t pos = 0;
+        while ((pos = result.find(rule.first, pos)) != std::string::npos) {
+            result.replace(pos, rule.first.length(), rule.second);
+            pos += rule.second.length();
+        }
+    }
+    
+    // Clean up multiple spaces
+    size_t pos = 0;
+    while ((pos = result.find("  ", pos)) != std::string::npos) {
+        result.replace(pos, 2, " ");
+    }
+    
+    // Trim leading/trailing spaces
+    if (!result.empty()) {
+        size_t start = result.find_first_not_of(" \t\n\r");
+        if (start != std::string::npos) {
+            size_t end = result.find_last_not_of(" \t\n\r");
+            result = result.substr(start, end - start + 1);
+        } else {
+            result = "";
+        }
+    }
+    
+    return result;
+}
+
+// IndicProcessor-style preprocessing with language codes  
+static std::string indictrans_preprocess_batch(const std::string& text, 
+                                              const std::string& src_lang, 
+                                              const std::string& tgt_lang) {
+    // Convert language codes to IndicTrans2 format
+    std::string src_code = src_lang;
+    std::string tgt_code = tgt_lang;
+    
+    auto src_it = indictrans_lang_codes.find(src_lang);
+    if (src_it != indictrans_lang_codes.end()) {
+        src_code = src_it->second;
+    }
+    
+    auto tgt_it = indictrans_lang_codes.find(tgt_lang);
+    if (tgt_it != indictrans_lang_codes.end()) {
+        tgt_code = tgt_it->second;
+    }
+    
+    // Preprocess the text (spacing around punctuation)
+    std::string processed_text = indictrans_preprocess_text(text);
+    
+    // Add language prefix (IndicProcessor format)
+    return src_code + " " + tgt_code + " " + processed_text;
+}
+
+// SentencePiece tokenization for IndicTrans2 models
+static std::vector<whisper_vocab::id> tokenize_indictrans(const whisper_vocab & vocab, const std::string & text, bool use_source = true) {
+    std::vector<whisper_vocab::id> tokens;
+    
+    if (!vocab.has_indictrans_tokenizers) {
+        WHISPER_LOG_ERROR("IndicTrans2 tokenizers not initialized\n");
+        return tokens;
+    }
+    
+    // Split the preprocessed text to extract language tags and actual text
+    std::istringstream iss(text);
+    std::string src_lang, tgt_lang, actual_text;
+    
+    if (!(iss >> src_lang >> tgt_lang)) {
+        WHISPER_LOG_ERROR("Failed to parse IndicTrans2 preprocessed text format\n");
+        return tokens;
+    }
+    
+    // Get the rest of the text (after the two language tags)
+    std::getline(iss, actual_text);
+    if (!actual_text.empty() && actual_text[0] == ' ') {
+        actual_text = actual_text.substr(1); // Remove leading space
+    }
+    
+    // Add language tag tokens
+    auto src_it = vocab.token_to_id.find(src_lang);
+    auto tgt_it = vocab.token_to_id.find(tgt_lang);
+    
+    if (src_it != vocab.token_to_id.end()) {
+        tokens.push_back(src_it->second);
+    } else {
+        WHISPER_LOG_ERROR("Source language tag '%s' not found in vocabulary\n", src_lang.c_str());
+    }
+    
+    if (tgt_it != vocab.token_to_id.end()) {
+        tokens.push_back(tgt_it->second);
+    } else {
+        WHISPER_LOG_ERROR("Target language tag '%s' not found in vocabulary\n", tgt_lang.c_str());
+    }
+    
+    // Select appropriate processor (source for input, target for output)
+    auto* processor = use_source ? vocab.indictrans_src_processor.get() : vocab.indictrans_tgt_processor.get();
+    
+    if (!processor) {
+        WHISPER_LOG_ERROR("IndicTrans2 %s processor not available\n", use_source ? "source" : "target");
+        return tokens;
+    }
+    
+    // Tokenize the actual text using SentencePiece
+    std::vector<std::string> pieces;
+    if (!processor->Encode(actual_text, &pieces).ok()) {
+        WHISPER_LOG_ERROR("Failed to tokenize text with IndicTrans2 %s processor\n", use_source ? "source" : "target");
+        return tokens;
+    }
+    
+    // Map SentencePiece pieces to vocabulary IDs
+    tokens.reserve(tokens.size() + pieces.size() + 1); // Reserve space for pieces + EOS
+    for (const std::string & piece : pieces) {
+        auto it = vocab.token_to_id.find(piece);
+        if (it != vocab.token_to_id.end()) {
+            tokens.push_back(it->second);
+        } else {
+            WHISPER_LOG_WARN("IndicTrans2 piece '%s' not found in vocabulary, using <unk>\n", piece.c_str());
+            auto unk_it = vocab.token_to_id.find("<unk>");
+            if (unk_it != vocab.token_to_id.end()) {
+                tokens.push_back(unk_it->second);
+            } else {
+                throw std::runtime_error("IndicTrans2 piece not found in vocabulary and <unk> not found");
+            }
+        }
+    }
+    
+    // Add EOS token
+    auto eos_it = vocab.token_to_id.find("</s>");
+    if (eos_it != vocab.token_to_id.end()) {
+        tokens.push_back(eos_it->second);
+    }
+    
+    return tokens;
+}
+
+// SentencePiece tokenization for Marian models
+static std::vector<whisper_vocab::id> tokenize_marian(const whisper_vocab & vocab, const std::string & text) {
     std::vector<whisper_vocab::id> tokens;
     
     if (!vocab.sp_processor || !vocab.has_sentencepiece) {
-        WHISPER_LOG_ERROR("SentencePiece processor not initialized for translation model\n");
+        WHISPER_LOG_ERROR("Marian SentencePiece processor not initialized\n");
         return tokens;
     }
     
     std::vector<std::string> pieces;
     if (!vocab.sp_processor->Encode(text, &pieces).ok()) {
-        WHISPER_LOG_ERROR("Failed to tokenize text with SentencePiece\n");
+        WHISPER_LOG_ERROR("Failed to tokenize text with Marian SentencePiece\n");
         return tokens;
     }
     
@@ -4093,6 +4315,21 @@ static std::vector<whisper_vocab::id> tokenize_sentencepiece(const whisper_vocab
     }
     
     return tokens;
+}
+
+static std::vector<whisper_vocab::id> tokenize_sentencepiece(const whisper_vocab & vocab, const std::string & text, e_model model_type, bool use_source = true) {
+    if (model_type == MODEL_INDICTRANS) {
+        // Apply IndicProcessor-style preprocessing
+        // For now using default en->hi, can be made configurable later
+        std::string preprocessed_text = indictrans_preprocess_batch(text, "en", "hi");
+        WHISPER_LOG_DEBUG("IndicTrans2 preprocessing: '%s' -> '%s'\n", text.c_str(), preprocessed_text.c_str());
+        return tokenize_indictrans(vocab, preprocessed_text, use_source);
+    } else if (model_type == MODEL_MARIAN) {
+        return tokenize_marian(vocab, text);
+    } else {
+        WHISPER_LOG_ERROR("Unknown translation model type for SentencePiece tokenization\n");
+        return {};
+    }
 }
 
 // BPE tokenization for Whisper models
@@ -4159,7 +4396,7 @@ static std::vector<whisper_vocab::id> tokenize_bpe(const whisper_vocab & vocab, 
 // General tokenization function that dispatches to the appropriate tokenizer
 static std::vector<whisper_vocab::id> tokenize(const whisper_vocab & vocab, const std::string & text, e_model model_type) {
     if (is_translation_model(model_type)) {
-        return tokenize_sentencepiece(vocab, text);
+        return tokenize_sentencepiece(vocab, text, model_type);
     }
     return tokenize_bpe(vocab, text);
 }

@@ -15,19 +15,105 @@ import torch
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, AutoConfig
 
 
+def extract_sentencepiece_model(tokenizer):
+    """
+    Comprehensive SentencePiece model extraction for IndicTrans2 tokenizer.
+    IndicTrans2 has separate source and target SentencePiece models.
+    """
+    serialized_sp_model = b""
+    extraction_method = "none"
+    
+    try:
+        # Method 1: IndicTrans2 specific - extract source SentencePiece model
+        if hasattr(tokenizer, 'src_spm') and tokenizer.src_spm is not None:
+            serialized_sp_model = tokenizer.src_spm.serialized_model_proto()
+            extraction_method = "indictrans_src_spm"
+            print(f"✓ Extracted IndicTrans2 source SentencePiece model: {len(serialized_sp_model)} bytes")
+            
+        # Method 2: Try reading source SentencePiece model file directly
+        elif hasattr(tokenizer, 'src_spm_fp') and tokenizer.src_spm_fp:
+            import os
+            if os.path.exists(tokenizer.src_spm_fp):
+                with open(tokenizer.src_spm_fp, 'rb') as f:
+                    serialized_sp_model = f.read()
+                extraction_method = f"indictrans_src_file: {tokenizer.src_spm_fp}"
+                print(f"✓ Extracted from IndicTrans2 source file: {len(serialized_sp_model)} bytes")
+                
+        # Method 3: Fallback to target SentencePiece model if source not available
+        elif hasattr(tokenizer, 'tgt_spm') and tokenizer.tgt_spm is not None:
+            serialized_sp_model = tokenizer.tgt_spm.serialized_model_proto()
+            extraction_method = "indictrans_tgt_spm"
+            print(f"✓ Extracted IndicTrans2 target SentencePiece model: {len(serialized_sp_model)} bytes")
+            
+        # Method 4: Try reading target SentencePiece model file directly
+        elif hasattr(tokenizer, 'tgt_spm_fp') and tokenizer.tgt_spm_fp:
+            import os
+            if os.path.exists(tokenizer.tgt_spm_fp):
+                with open(tokenizer.tgt_spm_fp, 'rb') as f:
+                    serialized_sp_model = f.read()
+                extraction_method = f"indictrans_tgt_file: {tokenizer.tgt_spm_fp}"
+                print(f"✓ Extracted from IndicTrans2 target file: {len(serialized_sp_model)} bytes")
+                
+        # Method 5: Generic sp_model access (for other tokenizers)
+        elif hasattr(tokenizer, 'sp_model') and tokenizer.sp_model is not None:
+            serialized_sp_model = tokenizer.sp_model.serialized_model_proto()
+            extraction_method = "generic_sp_model"
+            print(f"✓ Extracted via generic sp_model: {len(serialized_sp_model)} bytes")
+            
+        # Method 6: Try to find .model file in tokenizer directory
+        elif hasattr(tokenizer, 'name_or_path'):
+            import os
+            import glob
+            
+            # Look for .model files in the tokenizer directory
+            base_path = tokenizer.name_or_path if os.path.isdir(tokenizer.name_or_path) else ""
+            if base_path:
+                model_files = glob.glob(os.path.join(base_path, "*.model"))
+                if model_files:
+                    model_file = model_files[0]  # Take the first .model file
+                    with open(model_file, 'rb') as f:
+                        serialized_sp_model = f.read()
+                    extraction_method = f"model_file: {model_file}"
+                    print(f"✓ Extracted from {model_file}: {len(serialized_sp_model)} bytes")
+        
+        # If we still don't have the model, provide detailed info
+        if len(serialized_sp_model) == 0:
+            print("⚠ Could not extract SentencePiece model")
+            print("IndicTrans2 tokenizer analysis:")
+            if hasattr(tokenizer, 'src_spm'):
+                print(f"  - Has src_spm: {tokenizer.src_spm is not None}")
+            if hasattr(tokenizer, 'tgt_spm'):
+                print(f"  - Has tgt_spm: {tokenizer.tgt_spm is not None}")
+            if hasattr(tokenizer, 'src_spm_fp'):
+                print(f"  - Source model file: {tokenizer.src_spm_fp}")
+            if hasattr(tokenizer, 'tgt_spm_fp'):
+                print(f"  - Target model file: {tokenizer.tgt_spm_fp}")
+                        
+        return serialized_sp_model, extraction_method
+        
+    except Exception as e:
+        print(f"Error in SentencePiece extraction: {e}")
+        import traceback
+        traceback.print_exc()
+        return b"", "error"
+
+
 def load_indictrans_model(model_path: Path):
     """Load IndicTrans2 model from directory or HuggingFace model name."""
     print(f"Loading IndicTrans2 model from {model_path}")
     
+    # Convert Path to string for HuggingFace compatibility
+    model_path_str = str(model_path)
+    
     # Load config
-    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    config = AutoConfig.from_pretrained(model_path_str, trust_remote_code=True)
     
     # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_path_str, trust_remote_code=True)
     
     # Load model
     model = AutoModelForSeq2SeqLM.from_pretrained(
-        model_path, 
+        model_path_str, 
         trust_remote_code=True,
         torch_dtype=torch.float32
     )
@@ -221,15 +307,32 @@ def convert_indictrans_to_ggml(model_path: Path, output_path: Path, use_f16: boo
     
     print(f"Vocabulary size: {len(vocab_tokens)}")
     
-    # Try to extract SentencePiece model if available
-    try:
-        # For IndicTrans2, tokenizer may not have direct SentencePiece access
-        # We'll create empty SentencePiece model data for now
-        serialized_sp_model = b""
-        print("Using empty SentencePiece model data for IndicTrans2")
-    except Exception as e:
-        print(f"Note: Could not extract SentencePiece model: {e}")
-        serialized_sp_model = b""
+    # Extract SentencePiece model from IndicTrans2 tokenizer
+    print("Extracting SentencePiece model from IndicTrans2 tokenizer...")
+    serialized_sp_model, extraction_method = extract_sentencepiece_model(tokenizer)
+    
+    if len(serialized_sp_model) > 0:
+        print(f"✓ SentencePiece model successfully extracted using method: {extraction_method}")
+    else:
+        print("⚠ Warning: Could not extract SentencePiece model")
+        print("This may cause tokenization issues in the converted model")
+        print("IndicTrans2 tokenizer details:")
+        print(f"  - Type: {type(tokenizer)}")
+        print(f"  - Name/Path: {getattr(tokenizer, 'name_or_path', 'Unknown')}")
+        print(f"  - Vocab size: {len(vocab)}")
+        
+        # Additional debugging info
+        special_tokens = {}
+        for attr in ['bos_token', 'eos_token', 'unk_token', 'sep_token', 'pad_token', 'cls_token', 'mask_token']:
+            if hasattr(tokenizer, attr):
+                token = getattr(tokenizer, attr)
+                if token is not None:
+                    special_tokens[attr] = str(token)
+        
+        if special_tokens:
+            print(f"  - Special tokens: {special_tokens}")
+    
+    print(f"Final SentencePiece model size: {len(serialized_sp_model)} bytes")
     
     with open(output_path, 'wb') as fout:
         print("Writing header...")
