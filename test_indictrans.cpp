@@ -30,7 +30,6 @@ int main(int argc, char* argv[]) {
     
     std::cout << "Model loaded successfully!" << std::endl;
     std::cout << "Model type: " << whisper_model_type_readable(ctx) << std::endl;
-    std::cout << "Vocab size: " << whisper_model_n_vocab(ctx) << std::endl;
     
     // Verify this is an IndicTrans2 model
     if (strcmp(whisper_model_type_readable(ctx), "indictrans") != 0) {

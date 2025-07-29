@@ -15,6 +15,32 @@ import torch
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, AutoConfig
 
 
+def extract_indictrans_dual_sentencepiece_models(tokenizer):
+    """
+    Extract both source and target SentencePiece models for IndicTrans2 tokenizer.
+    Returns (src_model, tgt_model, src_vocab_size, tgt_vocab_size).
+    """
+    src_model = b""
+    tgt_model = b""
+    src_vocab_size = 0
+    tgt_vocab_size = 0
+    
+    if hasattr(tokenizer, 'src_spm') and tokenizer.src_spm is not None:
+        src_model = tokenizer.src_spm.serialized_model_proto()
+        src_vocab_size = tokenizer.src_vocab_size
+        print(f"✓ Extracted IndicTrans2 source SentencePiece model: {len(src_model)} bytes, vocab_size: {src_vocab_size}")
+        
+    if hasattr(tokenizer, 'tgt_spm') and tokenizer.tgt_spm is not None:
+        tgt_model = tokenizer.tgt_spm.serialized_model_proto()
+        tgt_vocab_size = tokenizer.tgt_vocab_size
+        print(f"✓ Extracted IndicTrans2 target SentencePiece model: {len(tgt_model)} bytes, vocab_size: {tgt_vocab_size}")
+        
+    if len(src_model) == 0 or len(tgt_model) == 0:
+        raise RuntimeError("Could not extract both source and target SentencePiece models for IndicTrans2 tokenizer")
+        
+    return src_model, tgt_model, src_vocab_size, tgt_vocab_size
+
+
 def extract_sentencepiece_model(tokenizer):
     """
     Comprehensive SentencePiece model extraction for IndicTrans2 tokenizer.
@@ -146,6 +172,34 @@ def write_header(fout, config, use_f16=True):
     fout.write(struct.pack("i", 2))  # Model type: 2 = INDICTRANS (field_10)
     fout.write(struct.pack("i", 1 if use_f16 else 0))  # use f16
     fout.write(struct.pack("i", decoder_vocab_size))  # decoder vocab size (field_12 - IndicTrans2 specific)
+    
+    # Write IndicTrans2-specific configuration parameters
+    fout.write(struct.pack("?", getattr(config, 'encoder_normalize_before', True)))  # encoder_normalize_before
+    fout.write(struct.pack("?", getattr(config, 'decoder_normalize_before', True)))  # decoder_normalize_before
+    fout.write(struct.pack("?", getattr(config, 'layernorm_embedding', True)))       # layernorm_embedding
+    fout.write(struct.pack("?", getattr(config, 'scale_embedding', True)))           # scale_embedding
+    fout.write(struct.pack("i", getattr(config, 'encoder_embed_dim', 512)))          # encoder_embed_dim
+    fout.write(struct.pack("i", getattr(config, 'decoder_embed_dim', 512)))          # decoder_embed_dim
+    fout.write(struct.pack("i", getattr(config, 'encoder_attention_heads', 8)))      # encoder_attention_heads
+    fout.write(struct.pack("i", getattr(config, 'decoder_attention_heads', 8)))      # decoder_attention_heads
+    fout.write(struct.pack("i", getattr(config, 'encoder_ffn_dim', 2048)))           # encoder_ffn_dim
+    fout.write(struct.pack("i", getattr(config, 'decoder_ffn_dim', 2048)))           # decoder_ffn_dim
+    fout.write(struct.pack("i", getattr(config, 'encoder_layers', 6)))               # encoder_layers
+    fout.write(struct.pack("i", getattr(config, 'decoder_layers', 6)))               # decoder_layers
+    
+    print(f"IndicTrans2 config written:")
+    print(f"  encoder_normalize_before: {getattr(config, 'encoder_normalize_before', True)}")
+    print(f"  decoder_normalize_before: {getattr(config, 'decoder_normalize_before', True)}")
+    print(f"  layernorm_embedding: {getattr(config, 'layernorm_embedding', True)}")
+    print(f"  scale_embedding: {getattr(config, 'scale_embedding', True)}")
+    print(f"  encoder_embed_dim: {getattr(config, 'encoder_embed_dim', 512)}")
+    print(f"  decoder_embed_dim: {getattr(config, 'decoder_embed_dim', 512)}")
+    print(f"  encoder_attention_heads: {getattr(config, 'encoder_attention_heads', 8)}")
+    print(f"  decoder_attention_heads: {getattr(config, 'decoder_attention_heads', 8)}")
+    print(f"  encoder_ffn_dim: {getattr(config, 'encoder_ffn_dim', 2048)}")
+    print(f"  decoder_ffn_dim: {getattr(config, 'decoder_ffn_dim', 2048)}")
+    print(f"  encoder_layers: {getattr(config, 'encoder_layers', 6)}")
+    print(f"  decoder_layers: {getattr(config, 'decoder_layers', 6)}")
 
 
 def write_vocabulary(fout, tokenizer):
@@ -307,32 +361,9 @@ def convert_indictrans_to_ggml(model_path: Path, output_path: Path, use_f16: boo
     
     print(f"Vocabulary size: {len(vocab_tokens)}")
     
-    # Extract SentencePiece model from IndicTrans2 tokenizer
-    print("Extracting SentencePiece model from IndicTrans2 tokenizer...")
-    serialized_sp_model, extraction_method = extract_sentencepiece_model(tokenizer)
-    
-    if len(serialized_sp_model) > 0:
-        print(f"✓ SentencePiece model successfully extracted using method: {extraction_method}")
-    else:
-        print("⚠ Warning: Could not extract SentencePiece model")
-        print("This may cause tokenization issues in the converted model")
-        print("IndicTrans2 tokenizer details:")
-        print(f"  - Type: {type(tokenizer)}")
-        print(f"  - Name/Path: {getattr(tokenizer, 'name_or_path', 'Unknown')}")
-        print(f"  - Vocab size: {len(vocab)}")
-        
-        # Additional debugging info
-        special_tokens = {}
-        for attr in ['bos_token', 'eos_token', 'unk_token', 'sep_token', 'pad_token', 'cls_token', 'mask_token']:
-            if hasattr(tokenizer, attr):
-                token = getattr(tokenizer, attr)
-                if token is not None:
-                    special_tokens[attr] = str(token)
-        
-        if special_tokens:
-            print(f"  - Special tokens: {special_tokens}")
-    
-    print(f"Final SentencePiece model size: {len(serialized_sp_model)} bytes")
+    print("Extracting IndicTrans2 dual SentencePiece models...")
+    src_sp_model, tgt_sp_model, src_vocab_size, tgt_vocab_size = extract_indictrans_dual_sentencepiece_models(tokenizer)
+    print(f"Final SentencePiece models: src={len(src_sp_model)} bytes, tgt={len(tgt_sp_model)} bytes")
     
     with open(output_path, 'wb') as fout:
         print("Writing header...")
@@ -341,10 +372,18 @@ def convert_indictrans_to_ggml(model_path: Path, output_path: Path, use_f16: boo
         print("Writing vocabulary...")
         write_vocabulary(fout, tokenizer)
         
-        # Write SentencePiece model data
-        fout.write(struct.pack("i", len(serialized_sp_model)))
-        if len(serialized_sp_model) > 0:
-            fout.write(serialized_sp_model)
+        print(f"Writing SentencePiece models: src={len(src_sp_model)} bytes, tgt={len(tgt_sp_model)} bytes")
+        
+        fout.write(struct.pack("i", len(src_sp_model)))
+        if len(src_sp_model) > 0:
+            fout.write(src_sp_model)
+            
+        fout.write(struct.pack("i", len(tgt_sp_model)))
+        if len(tgt_sp_model) > 0:
+            fout.write(tgt_sp_model)
+            
+        fout.write(struct.pack("i", src_vocab_size))
+        fout.write(struct.pack("i", tgt_vocab_size))
         
         print(f"Converting {len(state_dict)} tensors...")
         shared_tensor = None

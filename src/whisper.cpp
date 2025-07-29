@@ -508,6 +508,10 @@ struct whisper_vocab {
     std::unique_ptr<sentencepiece::SentencePieceProcessor> indictrans_src_processor;
     std::unique_ptr<sentencepiece::SentencePieceProcessor> indictrans_tgt_processor;
     bool has_indictrans_tokenizers = false;
+    
+    // IndicTrans2 vocabulary sizes
+    int32_t indictrans_src_vocab_size = 0;
+    int32_t indictrans_tgt_vocab_size = 0;
 
     bool is_multilingual() const {
         return n_vocab >= 51865;
@@ -668,6 +672,20 @@ struct whisper_hparams {
     int32_t n_tgt_vocab   = 0;    // Target vocabulary size for translation models (decoder vocab for IndicTrans2)
     int32_t n_max_seq_len = 512;  // Maximum sequence length for translation models
     int32_t d_model = 512;
+    
+    // IndicTrans2-specific parameters
+    bool encoder_normalize_before = false;  // Pre-normalization in encoder layers
+    bool decoder_normalize_before = false;  // Pre-normalization in decoder layers  
+    bool layernorm_embedding = false;       // Layer normalization after embeddings
+    bool scale_embedding = false;           // Scale embeddings by sqrt(d_model)
+    int32_t encoder_embed_dim = 512;        // Encoder embedding dimension
+    int32_t decoder_embed_dim = 512;        // Decoder embedding dimension
+    int32_t encoder_attention_heads = 8;    // Number of encoder attention heads
+    int32_t decoder_attention_heads = 8;    // Number of decoder attention heads
+    int32_t encoder_ffn_dim = 2048;         // Encoder feed-forward dimension
+    int32_t decoder_ffn_dim = 2048;         // Decoder feed-forward dimension
+    int32_t encoder_layers = 6;             // Number of encoder layers
+    int32_t decoder_layers = 6;             // Number of decoder layers
 };
 
 // audio encoding layer
@@ -1567,6 +1585,48 @@ static ggml_backend_buffer_type_t select_weight_buft(const whisper_hparams & hpa
 //
 // see the convert-pt-to-ggml.py script for details
 //
+
+static bool load_sentencepiece_model(
+    whisper_model_loader * loader,
+    std::unique_ptr<sentencepiece::SentencePieceProcessor>& processor,
+    const char* model_name) {
+    
+    int32_t sp_model_size = 0;
+    read_safe(loader, sp_model_size);
+    
+    if (sp_model_size > 0) {
+        std::vector<char> sp_model_data(sp_model_size);
+        loader->read(loader->context, sp_model_data.data(), sp_model_size);
+        std::string serialized_model(sp_model_data.data(), sp_model_size);
+        
+        auto status = processor->LoadFromSerializedProto(serialized_model);
+        if (status.ok()) {
+            WHISPER_LOG_INFO("%s: %s SentencePiece processor loaded (%d bytes)\n", __func__, model_name, sp_model_size);
+            return true;
+        } else {
+            WHISPER_LOG_WARN("%s: Failed to load %s processor: %s\n", __func__, model_name, status.ToString().c_str());
+            return false;
+        }
+    }
+    return false;
+}
+
+static void compute_sinusoidal_positional_embeddings_to_buffer(float* data, int d_model, int max_len) {
+    // Compute sinusoidal positional embeddings for IndicTrans2
+    // IMPORTANT: IndicTrans2 uses an offset - positions don't start at 0, but at 2
+     
+    const int half_dim = d_model / 2;
+     
+    for (int table_pos = 0; table_pos < max_len; table_pos++) {
+        for (int i = 0; i < half_dim; i++) {
+            float freq = powf(10000.0f, -((float)i / (half_dim - 1)));
+            float angle = table_pos * freq;
+            data[table_pos * d_model + i] = sinf(angle);
+            data[table_pos * d_model + (i + half_dim)] = cosf(angle);
+        }
+    }
+}
+
 static bool whisper_model_load(struct whisper_model_loader * loader, whisper_context & wctx) {
     WHISPER_LOG_INFO("%s: loading model\n", __func__);
 
@@ -1634,11 +1694,38 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
                 mver = " IndicTrans2";
                 // For IndicTrans2, read the additional decoder vocab size field
                 read_safe(loader, hparams.n_tgt_vocab);
+                
+                // Read IndicTrans2-specific configuration parameters
+                read_safe(loader, hparams.encoder_normalize_before);
+                read_safe(loader, hparams.decoder_normalize_before);
+                read_safe(loader, hparams.layernorm_embedding);
+                read_safe(loader, hparams.scale_embedding);
+                read_safe(loader, hparams.encoder_embed_dim);
+                read_safe(loader, hparams.decoder_embed_dim);
+                read_safe(loader, hparams.encoder_attention_heads);
+                read_safe(loader, hparams.decoder_attention_heads);
+                read_safe(loader, hparams.encoder_ffn_dim);
+                read_safe(loader, hparams.decoder_ffn_dim);
+                read_safe(loader, hparams.encoder_layers);
+                read_safe(loader, hparams.decoder_layers);
+                
                 WHISPER_LOG_INFO("%s: Detected IndicTrans2 translation model "
                                  "(explicit type)\n",
                                  __func__);
                 WHISPER_LOG_INFO("%s: Encoder vocab size = %d, Decoder vocab size = %d\n", 
                                  __func__, hparams.n_vocab, hparams.n_tgt_vocab);
+                WHISPER_LOG_INFO("%s: IndicTrans2 config - normalize_before: enc=%d dec=%d, "
+                                 "layernorm_embedding=%d, scale_embedding=%d\n",
+                                 __func__, hparams.encoder_normalize_before, 
+                                 hparams.decoder_normalize_before, hparams.layernorm_embedding,
+                                 hparams.scale_embedding);
+                WHISPER_LOG_INFO("%s: IndicTrans2 dimensions - encoder: %dx%d heads=%d ffn=%d layers=%d, "
+                                 "decoder: %dx%d heads=%d ffn=%d layers=%d\n",
+                                 __func__, hparams.encoder_embed_dim, hparams.encoder_embed_dim,
+                                 hparams.encoder_attention_heads, hparams.encoder_ffn_dim, 
+                                 hparams.encoder_layers, hparams.decoder_embed_dim, 
+                                 hparams.decoder_embed_dim, hparams.decoder_attention_heads,
+                                 hparams.decoder_ffn_dim, hparams.decoder_layers);
                 break;
             default:
                throw std::runtime_error("Invalid model type");
@@ -1702,12 +1789,10 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
         loader->read(loader->context, filters.data.data(), filters.data.size() * sizeof(float));
         BYTESWAP_FILTERS(filters);
     } else {
-        // For Translation models, initialize empty filters since they're not used
         auto & filters = wctx.model.filters;
         filters.n_mel = 0;
         filters.n_fft = 0;
         filters.data.clear();
-        WHISPER_LOG_INFO("%s: Skipping mel filters for Translation model\n", __func__);
     }
 
     // load vocab
@@ -1753,60 +1838,32 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
             WHISPER_LOG_INFO("%s: %s model detected - using complete vocabulary (%d tokens)\n", __func__, model_name, n_vocab);
             vocab.n_vocab = n_vocab;
             
-            int32_t sp_model_size = 0;
-            read_safe(loader, sp_model_size);
+            if (model.type == MODEL_INDICTRANS) {
+                WHISPER_LOG_INFO("%s: Loading IndicTrans2 dual SentencePiece tokenizers...\n", __func__);
+                
+                vocab.indictrans_src_processor = std::make_unique<sentencepiece::SentencePieceProcessor>();
+                vocab.indictrans_tgt_processor = std::make_unique<sentencepiece::SentencePieceProcessor>();
+                
+                bool src_loaded = load_sentencepiece_model(loader, vocab.indictrans_src_processor, "IndicTrans2 source");
+                bool tgt_loaded = load_sentencepiece_model(loader, vocab.indictrans_tgt_processor, "IndicTrans2 target");
+                read_safe(loader, vocab.indictrans_src_vocab_size);
+                read_safe(loader, vocab.indictrans_tgt_vocab_size);
+                
+                if (src_loaded && tgt_loaded) {
+                    vocab.has_indictrans_tokenizers = true;
             
-            if (sp_model_size > 0) {
-                std::vector<char> sp_model_data(sp_model_size);
-                loader->read(loader->context, sp_model_data.data(), sp_model_size);
-                
-                std::string serialized_model(sp_model_data.data(), sp_model_size);
-                
-                if (model.type == MODEL_INDICTRANS) {
-                    // IndicTrans2: Initialize source processor (for now using the single model for both)
-                    WHISPER_LOG_INFO("%s: Initializing IndicTrans2 tokenizers...\n", __func__);
-                    
-                    vocab.indictrans_src_processor = std::make_unique<sentencepiece::SentencePieceProcessor>();
-                    vocab.indictrans_tgt_processor = std::make_unique<sentencepiece::SentencePieceProcessor>();
-                    
-                    // Load the source model (currently the conversion script only embeds the source model)
-                    auto src_status = vocab.indictrans_src_processor->LoadFromSerializedProto(serialized_model);
-                    
-                    if (src_status.ok()) {
-                        WHISPER_LOG_INFO("%s: IndicTrans2 source SentencePiece processor loaded (%d bytes)\n", __func__, sp_model_size);
-                        
-                        // For now, use the same model for target (this is a temporary solution)
-                        auto tgt_status = vocab.indictrans_tgt_processor->LoadFromSerializedProto(serialized_model);
-                        
-                        if (tgt_status.ok()) {
-                            vocab.has_indictrans_tokenizers = true;
-                            WHISPER_LOG_INFO("%s: IndicTrans2 target SentencePiece processor loaded (shared model)\n", __func__);
-                        } else {
-                            WHISPER_LOG_WARN("%s: Failed to load IndicTrans2 target processor: %s\n", __func__, tgt_status.ToString().c_str());
-                            vocab.has_indictrans_tokenizers = false;
-                        }
-                    } else {
-                        WHISPER_LOG_WARN("%s: Failed to load IndicTrans2 source processor: %s\n", __func__, src_status.ToString().c_str());
-                        vocab.has_indictrans_tokenizers = false;
-                    }
+                    WHISPER_LOG_INFO("%s: src_vocab_size: %d\n", __func__, vocab.indictrans_src_vocab_size);
+                    WHISPER_LOG_INFO("%s: tgt_vocab_size: %d\n", __func__, vocab.indictrans_tgt_vocab_size);
+                    WHISPER_LOG_INFO("%s: tokenizer_type: dual_sentencepiece\n", __func__);
                 } else {
-                    // Marian: Use existing single processor
-                    vocab.sp_processor = std::make_unique<sentencepiece::SentencePieceProcessor>();
-                    auto status = vocab.sp_processor->LoadFromSerializedProto(serialized_model);
-                    
-                    if (status.ok()) {
-                        vocab.has_sentencepiece = true;
-                        WHISPER_LOG_INFO("%s: Marian SentencePiece processor loaded from serialized model data (%d bytes)\n", __func__, sp_model_size);
-                    } else {
-                        WHISPER_LOG_WARN("%s: Failed to load Marian SentencePiece processor from serialized data: %s\n", __func__, status.ToString().c_str());
-                        vocab.has_sentencepiece = false;
-                    }
+                    vocab.has_indictrans_tokenizers = false;
                 }
             } else {
-                WHISPER_LOG_WARN("%s: No SentencePiece model data found in GGML file. SentencePiece tokenization will not be available.\n", __func__);
-                if (model.type == MODEL_INDICTRANS) {
-                    vocab.has_indictrans_tokenizers = false;
+                vocab.sp_processor = std::make_unique<sentencepiece::SentencePieceProcessor>();
+                if (load_sentencepiece_model(loader, vocab.sp_processor, "Marian")) {
+                    vocab.has_sentencepiece = true;
                 } else {
+                    WHISPER_LOG_WARN("%s: No SentencePiece model data found in GGML file. SentencePiece tokenization will not be available.\n", __func__);
                     vocab.has_sentencepiece = false;
                 }
             }
@@ -1967,7 +2024,6 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
             model.e_conv_2_b = nullptr;
             model.e_ln_w = nullptr;
             model.e_ln_b = nullptr;
-            WHISPER_LOG_INFO("%s: Skipping Whisper-specific encoder tensors for Marian model\n", __func__);
         }
 
         // Create encoder layers - use standard ASR tensor system for compatibility
@@ -2053,7 +2109,6 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
             model.d_te = nullptr;
             model.d_ln_w = nullptr;
             model.d_ln_b = nullptr;
-            WHISPER_LOG_INFO("%s: Skipping Whisper-specific decoder tensors for Translation model\n", __func__);
         }
 
         for (int i = 0; i < n_text_layer; ++i) {
@@ -2182,6 +2237,10 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
             if (model.type == MODEL_MARIAN) {
                 meta_enc_pos_emb = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_text_state, n_text_ctx);  // Shape: (512, 512) 
                 meta_dec_pos_emb = ggml_new_tensor_2d(ctx, wtype, n_text_state, n_text_ctx);  // Shape: (512, 512)
+            } else if (model.type == MODEL_INDICTRANS) {
+                const int max_pos = 1024;  // IndicTrans2 typical max length
+                meta_enc_pos_emb = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_text_state, max_pos);  // Shape: (512, 1024)
+                meta_dec_pos_emb = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_text_state, max_pos);  // Shape: (512, 1024)
             }
             
             ggml_tensor * meta_enc_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_text_state);
@@ -2217,6 +2276,9 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
             if (model.type == MODEL_MARIAN) {
                 model.m_encoder_pos_emb = ggml_dup_tensor(marian_ctx, meta_enc_pos_emb);
                 model.m_decoder_pos_emb = ggml_dup_tensor(marian_ctx, meta_dec_pos_emb);
+            } else if (model.type == MODEL_INDICTRANS) {
+                model.m_encoder_pos_emb = ggml_dup_tensor(marian_ctx, meta_enc_pos_emb);
+                model.m_decoder_pos_emb = ggml_dup_tensor(marian_ctx, meta_dec_pos_emb);
             } else {
                 model.m_encoder_pos_emb = nullptr;
                 model.m_decoder_pos_emb = nullptr;
@@ -2250,6 +2312,7 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
                 model.tensors["encoder.embed_positions.weight"] = model.m_encoder_pos_emb;
                 model.tensors["decoder.embed_positions.weight"] = model.m_decoder_pos_emb;
             }
+            // Note: IndicTrans2 positional embeddings are computed internally, not loaded from file
             
             if (model.type == e_model::MODEL_INDICTRANS) {
                 model.tensors["encoder.layer_norm.weight"] = model.m_enc_layer_norm_w;
@@ -2376,6 +2439,20 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
         }
     }
 
+    if (model.type == MODEL_INDICTRANS) {
+        if (model.m_encoder_pos_emb && model.m_decoder_pos_emb) {
+            const int d_model = hparams.n_text_state;  // 512
+            const int max_pos = model.m_encoder_pos_emb->ne[1];  // 1024
+            
+            std::vector<float> pos_emb_data(d_model * max_pos);
+            compute_sinusoidal_positional_embeddings_to_buffer(pos_emb_data.data(), d_model, max_pos);
+            size_t bytes_to_copy = pos_emb_data.size() * sizeof(float);
+    
+            ggml_backend_tensor_set(model.m_encoder_pos_emb, pos_emb_data.data(), 0, bytes_to_copy);
+            ggml_backend_tensor_set(model.m_decoder_pos_emb, pos_emb_data.data(), 0, bytes_to_copy);
+        }
+    }
+
     for (auto & buf : model.buffers) {
         ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     }
@@ -2495,20 +2572,30 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
 
     ggml_cgraph * gf = ggml_new_graph_custom(ctx0, WHISPER_MAX_NODES, false);
     struct ggml_tensor * cur = nullptr;
-    if (is_translation_model(model.type))
-    {
-      if (wstate.text_tokens.size() == 0)
-      {
-        wstate.text_tokens.resize(7);
-      }
-      struct ggml_tensor* indices = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, wstate.text_tokens.size());
-      ggml_set_name(indices, "token_ids");
-      ggml_set_input(indices);
+    if (is_translation_model(model.type)) {
+        if (wstate.text_tokens.size() == 0) {
+            wstate.text_tokens.resize(7);
+        }
+        struct ggml_tensor *indices = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, wstate.text_tokens.size());
+        ggml_set_name(indices, "token_ids");
+        ggml_set_input(indices);
 
-      cur = ggml_get_rows(ctx0, wctx.model.m_encoder_embeddings, indices);
-      cur = ggml_scale(ctx0, cur, embed_scaling);
+        cur = ggml_get_rows(ctx0, wctx.model.m_encoder_embeddings, indices);
+
+        if (model.type == MODEL_INDICTRANS) {
+            if (hparams.scale_embedding) {
+                cur = ggml_scale(ctx0, cur, embed_scaling);
+            }
+
+            if (hparams.layernorm_embedding) {
+                cur = ggml_norm(ctx0, cur, hparams.eps);
+                cur = ggml_add(ctx0, ggml_mul(ctx0, cur, model.m_enc_layer_norm_w), model.m_enc_layer_norm_b);
+            }
+        } else {
+            cur = ggml_scale(ctx0, cur, embed_scaling);
+        }
     } else {
-      cur = ggml_view_tensor(ctx0, wstate.embd_conv);
+        cur = ggml_view_tensor(ctx0, wstate.embd_conv);
     }
 
     const float KQscale = 1.0f/sqrtf(float(n_state_head));
@@ -2544,30 +2631,42 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
     }
     else if (model.type == MODEL_INDICTRANS)
     {
-       // IndicTrans2 uses sinusoidal positional embeddings (computed on the fly)
-       // For now, we skip adding positional embeddings since they're handled in the model architecture
-       // TODO: Implement sinusoidal positional embedding computation if needed
-       WHISPER_LOG_DEBUG("%s: IndicTrans2 using sinusoidal positional embeddings (skipped)\n", __func__);
+       if (model.m_encoder_pos_emb) {
+           // IndicTrans2 positions start at padding_idx + 1 = 2, not 0!
+           const int padding_idx = 1;
+           const int first_token_pos = padding_idx + 1;
+           const size_t e_pe_stride = model.m_encoder_pos_emb->ne[0]*ggml_element_size(model.m_encoder_pos_emb);
+           const size_t e_pe_offset = first_token_pos * e_pe_stride;
+           
+           struct ggml_tensor* encoder_pos_emb = ggml_view_2d(ctx0, model.m_encoder_pos_emb, 
+                                                            model.m_encoder_pos_emb->ne[0], 
+                                                            wstate.text_tokens.size(), 
+                                                            e_pe_stride, 
+                                                            e_pe_offset);
+           ggml_tensor* temp = ggml_cont(ctx0, encoder_pos_emb);
+           cur = ggml_add(ctx0, cur, temp);
+       }
     }
-
-    // ===================================================================
-    // original:
-    //cur = ggml_add(ctx0, model.e_pe, ggml_transpose(ctx0, cur));
 
     struct ggml_tensor * inpL = cur;
 
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers_encoder[il];
 
-        if (!is_translation_model(model.type))
-        // norm
-        {
-            cur = ggml_norm(ctx0, inpL, hparams.eps);
+        struct ggml_tensor * attn_residual = inpL;
 
-            // cur = ln_0_w*cur + ln_0_b
-            cur = ggml_add(ctx0,
-                    ggml_mul(ctx0, cur, layer.attn_ln_0_w),
-                    layer.attn_ln_0_b);
+        if (model.type == MODEL_INDICTRANS) {
+            if (hparams.encoder_normalize_before) {
+                cur = ggml_norm(ctx0, inpL, hparams.eps);
+                cur = ggml_add(ctx0, ggml_mul(ctx0, cur, layer.attn_ln_0_w), layer.attn_ln_0_b);
+            } else {
+                cur = inpL;
+            }
+        } else if (!is_translation_model(model.type)) {
+            cur = ggml_norm(ctx0, inpL, hparams.eps);
+            cur = ggml_add(ctx0, ggml_mul(ctx0, cur, layer.attn_ln_0_w), layer.attn_ln_0_b);
+        } else {
+            cur = inpL;
         }
 
         // self-attention
@@ -2657,7 +2756,7 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
                             0, 2, 1, 3);
  
                 }
-    // K * Q
+                // K * Q
                 struct ggml_tensor * KQ = ggml_mul_mat(ctx0, K, Q);
 
                 struct ggml_tensor * KQ_soft_max = ggml_soft_max_ext(ctx0, KQ, nullptr, KQscale, 0.0f);
@@ -2708,14 +2807,43 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
 
        }
 
-        // add the input
-        cur = ggml_add(ctx0, cur, inpL);
+        if (model.type == MODEL_INDICTRANS) {
+            cur = ggml_add(ctx0, cur, attn_residual);
+            
+            if (!hparams.encoder_normalize_before) {
+                cur = ggml_norm(ctx0, cur, hparams.eps);
+                cur = ggml_add(ctx0, ggml_mul(ctx0, cur, layer.attn_ln_0_w), layer.attn_ln_0_b);
+            }
+        } else {
+            cur = ggml_add(ctx0, cur, inpL);
+        }
 
         struct ggml_tensor * inpFF = cur;
-        struct ggml_tensor * residual = nullptr;
-        // feed-forward network
-        {
-            // norm
+        // ffn
+        if (model.type == MODEL_INDICTRANS) {
+            struct ggml_tensor * ffn_residual = inpFF;
+            
+            if (hparams.encoder_normalize_before) {
+                cur = ggml_norm(ctx0, inpFF, hparams.eps);
+                cur = ggml_add(ctx0, ggml_mul(ctx0, cur, layer.mlp_ln_w), layer.mlp_ln_b);
+            } else {
+                cur = inpFF;
+            }
+            
+            cur = ggml_mul_mat(ctx0, layer.mlp_0_w, cur);
+            cur = ggml_add(ctx0, cur, layer.mlp_0_b);
+            cur = ggml_gelu(ctx0, cur);
+            cur = ggml_mul_mat(ctx0, layer.mlp_1_w, cur);
+            cur = ggml_add(ctx0, cur, layer.mlp_1_b);
+            cur = ggml_add(ctx0, cur, ffn_residual);
+            
+            if (!hparams.encoder_normalize_before) {
+                cur = ggml_norm(ctx0, cur, hparams.eps);
+                cur = ggml_add(ctx0, ggml_mul(ctx0, cur, layer.mlp_ln_w), layer.mlp_ln_b);
+            }
+        } else {
+            struct ggml_tensor * residual = nullptr;
+            
             {
                 cur = ggml_norm(ctx0, inpFF, hparams.eps);
 
@@ -2725,7 +2853,6 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
                   cur = ggml_add(ctx0,
                         ggml_mul(ctx0, cur, layer.mlp_ln_w),
                         layer.mlp_ln_b);
- 
                 }
                 else 
                 {
@@ -2738,10 +2865,7 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
             }
 
             // fully connected
-            cur = ggml_mul_mat(ctx0,
-                    layer.mlp_0_w,
-                    cur);
-
+            cur = ggml_mul_mat(ctx0, layer.mlp_0_w, cur);
             cur = ggml_add(ctx0, cur, layer.mlp_0_b);
 
             // GELU activation
@@ -2755,10 +2879,7 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
             }
             
             // projection
-            cur = ggml_mul_mat(ctx0,
-                    layer.mlp_1_w,
-                    cur);
-
+            cur = ggml_mul_mat(ctx0, layer.mlp_1_w, cur);
             cur = ggml_add(ctx0, cur, layer.mlp_1_b);
 
             if (is_translation_model(model.type)) 
@@ -2769,51 +2890,33 @@ static struct ggml_cgraph * whisper_build_graph_encoder(
               // LayerNorm
               cur = ggml_norm(ctx0, cur, hparams.eps);
 
-              cur = ggml_add(ctx0,
-                     ggml_mul(ctx0, cur, layer.mlp_ln_w),
-                     layer.mlp_ln_b);
+              cur = ggml_add(ctx0, ggml_mul(ctx0, cur, layer.mlp_ln_w), layer.mlp_ln_b);
             }
-       }
-       if (!is_translation_model(model.type))
-       {
-        inpL = ggml_add(ctx0, cur, inpFF);
-       }
-       else 
-       {
-         inpL = cur;
-       }
-
+        }
+        if (model.type == MODEL_MARIAN) {
+            inpL = ggml_add(ctx0, cur, inpFF);
+        } else {
+            inpL = cur;
+        }
     }
 
     cur = inpL;
 
-    // norm
-    {
-        if (!is_translation_model(model.type))
-        {
-             cur = ggml_norm(ctx0, cur, hparams.eps);
-        
-             // cur = ln_f_g*cur + ln_f_b
-             cur = ggml_add(ctx0,
-                     ggml_mul(ctx0, cur, model.e_ln_w),
-                     model.e_ln_b);
-        }
+    if (model.type == MODEL_INDICTRANS && hparams.encoder_normalize_before) {
+        cur = ggml_norm(ctx0, cur, hparams.eps);
+        cur = ggml_add(ctx0,
+                ggml_mul(ctx0, cur, model.m_encoder_norm_w),
+                model.m_encoder_norm_b);
+    } else if (!is_translation_model(model.type)) {
+        cur = ggml_norm(ctx0, cur, hparams.eps);
+        cur = ggml_add(ctx0,
+                ggml_mul(ctx0, cur, model.e_ln_w),
+                model.e_ln_b);
     }
 
     ggml_build_forward_expand(gf, cur);
     wstate.tmp_tensor = cur;
     wstate.embd_enc = cur;
-
-    //ggml_graph_print(gf);
-
-    ////////////////////////////////////////////////////////////////////////////
-
-    //printf("%s: used_mem = %f MB, %f MB, %f MB %f MB %f MB\n", __func__,
-    //        ggml_used_mem(ctx0)/1e6,
-    //        wstate.get_buf_max_mem(0)/1e6,
-    //        wstate.get_buf_max_mem(1)/1e6,
-    //        wstate.get_buf_max_mem(2)/1e6,
-    //        wstate.get_buf_max_mem(3)/1e6);
 
     ggml_free(ctx0);
 
@@ -2900,8 +3003,9 @@ static bool marian_encode_internal(
         whisper_context & wctx,
           whisper_state & wstate)
 {
-    // Done for debug purposes to have a match with python input frame.
-    wstate.text_tokens.push_back(0);
+    if (wctx.model.type != MODEL_INDICTRANS) {
+        wstate.text_tokens.push_back(0);
+    }
     auto & sched = wstate.sched_encode.sched;
     ggml_cgraph* gf = whisper_build_graph_encoder(wctx, wstate);
     if (!ggml_backend_sched_alloc_graph(sched, gf)) {
@@ -2923,14 +3027,24 @@ static bool marian_encode_internal(
 
     wstate.encoder_result.resize(ggml_nelements(wstate.embd_enc));
     ggml_backend_tensor_get(wstate.embd_enc, wstate.encoder_result.data(), 0, sizeof(float) * wstate.encoder_result.size());
-    // for (int i = 0; i < 10; ++i)
-    // {
-    //    std::cout<<std::setprecision(4)<<wstate.encoder_result[i]<<" ";
-    // }
-    // std::cout.flush();
+
+    int hidden_dim = (int)wstate.embd_enc->ne[0];
+    int token_0_start = 0;
+
+    std::cout << "Token 0 - First 5 values: ";
+    for (int i = 0; i < 5; ++i) {
+        std::cout << std::setprecision(4) << wstate.encoder_result[token_0_start + i] << " ";
+    }
+    std::cout << std::endl;
+    std::cout << "Token 0 - Last 5 values: ";
+    for (int i = hidden_dim - 5; i < hidden_dim; ++i) {
+        std::cout << std::setprecision(4) << wstate.encoder_result[token_0_start + i] << " ";
+    }
+    std::cout << std::endl;
+    std::cout.flush();
+
     return true;
 }
-
 
 // evaluate the encoder with the given state
 //
@@ -3037,7 +3151,7 @@ static bool whisper_encode_internal(
     wstate.t_encode_us += ggml_time_us() - t_start_us;
     wstate.n_encode++;
 
-    return !(abort_callback && abort_callback(abort_callback_data));
+         return !(abort_callback && abort_callback(abort_callback_data));
 }
 
 static struct ggml_cgraph * whisper_build_graph_decoder(
@@ -3665,13 +3779,6 @@ static bool marian_decode_internal(
       return false;
   }
   
-  
-
-  // for ( int i = 0; i < 10;++i){
-
-  //    std::cout<<std::setprecision(5)<<*(debug_buffer.rbegin() + i)<<" ";
-  // }
-
   std::cout.flush();
 
   return true;
@@ -4319,11 +4426,10 @@ static std::vector<whisper_vocab::id> tokenize_marian(const whisper_vocab & voca
 
 static std::vector<whisper_vocab::id> tokenize_sentencepiece(const whisper_vocab & vocab, const std::string & text, e_model model_type, bool use_source = true) {
     if (model_type == MODEL_INDICTRANS) {
-        // Apply IndicProcessor-style preprocessing
-        // For now using default en->hi, can be made configurable later
+        // TODO GUSTAVO: read language direction from model metadata
         std::string preprocessed_text = indictrans_preprocess_batch(text, "en", "hi");
-        WHISPER_LOG_DEBUG("IndicTrans2 preprocessing: '%s' -> '%s'\n", text.c_str(), preprocessed_text.c_str());
-        return tokenize_indictrans(vocab, preprocessed_text, use_source);
+        std::vector<whisper_vocab::id> tokens = tokenize_indictrans(vocab, preprocessed_text, use_source);        
+        return tokens;
     } else if (model_type == MODEL_MARIAN) {
         return tokenize_marian(vocab, text);
     } else {
@@ -4551,12 +4657,8 @@ struct whisper_state * whisper_init_state(whisper_context * ctx) {
 
     state->decoders[0].rng = std::mt19937(0);
 
-    // conv allocator - skip for translation models since they don't have conv layers
     if (!is_translation_model(ctx->model.type)) {
-        bool ok = whisper_sched_graph_init(state->sched_conv, state->backends,
-                [&]() {
-                    return whisper_build_graph_conv(*ctx, *state);
-                });
+        bool ok = whisper_sched_graph_init(state->sched_conv, state->backends, [&]() { return whisper_build_graph_conv(*ctx, *state); });
 
         if (!ok) {
             WHISPER_LOG_ERROR("%s: failed to init conv allocator\n", __func__);
@@ -4565,16 +4667,10 @@ struct whisper_state * whisper_init_state(whisper_context * ctx) {
         }
 
         WHISPER_LOG_INFO("%s: compute buffer (conv)   = %7.2f MB\n", __func__, whisper_sched_size(state->sched_conv) / 1e6);
-    } else {
-        WHISPER_LOG_INFO("%s: skipping conv allocator for translation model\n", __func__);
     }
 
-    // encoder allocator
     if (!whisper_encode_external(*state)) {
-        bool ok = whisper_sched_graph_init(state->sched_encode, state->backends,
-                [&]() {
-                    return whisper_build_graph_encoder(*ctx, *state);
-});
+        bool ok = whisper_sched_graph_init(state->sched_encode, state->backends, [&]() { return whisper_build_graph_encoder(*ctx, *state); });
 
         if (!ok) {
             WHISPER_LOG_ERROR("%s: failed to init encoder allocator\n", __func__);
@@ -4583,16 +4679,10 @@ struct whisper_state * whisper_init_state(whisper_context * ctx) {
         }
 
         WHISPER_LOG_INFO("%s: compute buffer (encode) = %7.2f MB\n", __func__, whisper_sched_size(state->sched_encode) / 1e6);
-    } else if (is_translation_model(ctx->model.type)) {
-        WHISPER_LOG_INFO("%s: skipping encoder allocator for translation model\n", __func__);
     }
 
-    // cross allocator - skip for translation models for now  
     if (!is_translation_model(ctx->model.type)) {
-        bool ok = whisper_sched_graph_init(state->sched_cross, state->backends,
-                [&]() {
-                    return whisper_build_graph_cross(*ctx, *state);
-                });
+        bool ok = whisper_sched_graph_init(state->sched_cross, state->backends, [&]() { return whisper_build_graph_cross(*ctx, *state); });
 
         if (!ok) {
             WHISPER_LOG_ERROR("%s: failed to init cross allocator\n", __func__);
@@ -4601,23 +4691,19 @@ struct whisper_state * whisper_init_state(whisper_context * ctx) {
         }
 
         WHISPER_LOG_INFO("%s: compute buffer (cross)  = %7.2f MB\n", __func__, whisper_sched_size(state->sched_cross) / 1e6);
-    } else {
-        WHISPER_LOG_INFO("%s: skipping cross allocator for translation model\n", __func__);
     }
 
-    // decoder allocator - skip for Marian models for now
-    bool ok = whisper_sched_graph_init(state->sched_decode, state->backends,
-            [&]() {
-                const auto & hparams = ctx->model.hparams;
+    bool ok = whisper_sched_graph_init(state->sched_decode, state->backends, [&]() {
+        const auto &hparams = ctx->model.hparams;
 
-                // TODO: make sure this is the worst-case scenario
-                const int n_tokens = hparams.n_text_ctx;
-                const int n_past   = 0;
+        // TODO: make sure this is the worst-case scenario
+        const int n_tokens = hparams.n_text_ctx;
+        const int n_past = 0;
 
-                whisper_batch_prep_legacy(state->batch, nullptr, n_tokens, n_past, 0);
+        whisper_batch_prep_legacy(state->batch, nullptr, n_tokens, n_past, 0);
 
-                return whisper_build_graph_decoder(*ctx, *state, state->batch, ctx->params.dtw_token_timestamps, true);
-            });
+        return whisper_build_graph_decoder(*ctx, *state, state->batch, ctx->params.dtw_token_timestamps, true);
+    });
 
     if (!ok) {
         WHISPER_LOG_ERROR("%s: failed to init decoder allocator\n", __func__);
@@ -7952,14 +8038,13 @@ int indictrans_full(struct whisper_context * ctx,
         std::cout << "Tokenization failed!" << std::endl;
     }
 
-    /* // encoder - reuse marian encoder since it's the same transformer architecture
     if (!marian_encode_internal(*ctx, *ctx->state)) {
         std::cout << "Failed to run encoder." << std::endl;
         std::cout.flush();
         return -1;
     }
 
-    // decoder - reuse marian decoder since it's the same transformer architecture  
+    /* // decoder - reuse marian decoder since it's the same transformer architecture  
     if (!marian_decode_internal(*ctx, *ctx->state)) {
         std::cout << "Failed to run decoder" << std::endl;
         std::cout.flush();
