@@ -28,12 +28,12 @@ def extract_indictrans_dual_sentencepiece_models(tokenizer):
     if hasattr(tokenizer, 'src_spm') and tokenizer.src_spm is not None:
         src_model = tokenizer.src_spm.serialized_model_proto()
         src_vocab_size = tokenizer.src_vocab_size
-        print(f"✓ Extracted IndicTrans2 source SentencePiece model: {len(src_model)} bytes, vocab_size: {src_vocab_size}")
+        print(f"Extracted IndicTrans2 source SentencePiece model: {len(src_model)} bytes, vocab_size: {src_vocab_size}")
         
     if hasattr(tokenizer, 'tgt_spm') and tokenizer.tgt_spm is not None:
         tgt_model = tokenizer.tgt_spm.serialized_model_proto()
         tgt_vocab_size = tokenizer.tgt_vocab_size
-        print(f"✓ Extracted IndicTrans2 target SentencePiece model: {len(tgt_model)} bytes, vocab_size: {tgt_vocab_size}")
+        print(f"Extracted IndicTrans2 target SentencePiece model: {len(tgt_model)} bytes, vocab_size: {tgt_vocab_size}")
         
     if len(src_model) == 0 or len(tgt_model) == 0:
         raise RuntimeError("Could not extract both source and target SentencePiece models for IndicTrans2 tokenizer")
@@ -150,7 +150,7 @@ def load_indictrans_model(model_path: Path):
     return config, tokenizer, state_dict
 
 
-def write_header(fout, config, use_f16=True):
+def write_header(fout, config, src_lang: str, tgt_lang: str, use_f16: bool = True):
     """Write GGML header adapted for IndicTrans2 format."""
     # Magic number: "ggml" in hex
     fout.write(struct.pack("i", 0x67676d6c))
@@ -187,6 +187,14 @@ def write_header(fout, config, use_f16=True):
     fout.write(struct.pack("i", getattr(config, 'encoder_layers', 6)))               # encoder_layers
     fout.write(struct.pack("i", getattr(config, 'decoder_layers', 6)))               # decoder_layers
     
+    # Write language information
+    src_lang_bytes = src_lang.encode('utf-8')
+    tgt_lang_bytes = tgt_lang.encode('utf-8')
+    fout.write(struct.pack("i", len(src_lang_bytes)))                                # source language string length
+    fout.write(src_lang_bytes)                                                       # source language string
+    fout.write(struct.pack("i", len(tgt_lang_bytes)))                                # target language string length
+    fout.write(tgt_lang_bytes)                                                       # target language string
+    
     print(f"IndicTrans2 config written:")
     print(f"  encoder_normalize_before: {getattr(config, 'encoder_normalize_before', True)}")
     print(f"  decoder_normalize_before: {getattr(config, 'decoder_normalize_before', True)}")
@@ -200,6 +208,8 @@ def write_header(fout, config, use_f16=True):
     print(f"  decoder_ffn_dim: {getattr(config, 'decoder_ffn_dim', 2048)}")
     print(f"  encoder_layers: {getattr(config, 'encoder_layers', 6)}")
     print(f"  decoder_layers: {getattr(config, 'decoder_layers', 6)}")
+    print(f"  source_language: {src_lang}")
+    print(f"  target_language: {tgt_lang}")
 
 
 def write_vocabulary(fout, tokenizer):
@@ -344,7 +354,7 @@ def convert_tensor_name(original_name: str) -> str:
     return original_name
 
 
-def convert_indictrans_to_ggml(model_path: Path, output_path: Path, use_f16: bool = True):
+def convert_indictrans_to_ggml(model_path: Path, output_path: Path, src_lang: str, tgt_lang: str, use_f16: bool = True):
     """Convert IndicTrans2 model to GGML format."""
     print(f"Loading IndicTrans2 model from {model_path}")
     config, tokenizer, state_dict = load_indictrans_model(model_path)
@@ -367,7 +377,7 @@ def convert_indictrans_to_ggml(model_path: Path, output_path: Path, use_f16: boo
     
     with open(output_path, 'wb') as fout:
         print("Writing header...")
-        write_header(fout, config, use_f16)
+        write_header(fout, config, src_lang, tgt_lang, use_f16)
         
         print("Writing vocabulary...")
         write_vocabulary(fout, tokenizer)
@@ -407,8 +417,6 @@ def convert_indictrans_to_ggml(model_path: Path, output_path: Path, use_f16: boo
             # Convert tensor name
             ggml_name = convert_tensor_name(name)
             
-            print(f"Tensor: {ggml_name} is {tensor.dtype}")
-            
             # Convert to numpy
             if tensor.dtype == torch.float16:
                 np_tensor = tensor.to(torch.float32).numpy()
@@ -426,12 +434,16 @@ def convert_indictrans_to_ggml(model_path: Path, output_path: Path, use_f16: boo
 
 def main():
     parser = argparse.ArgumentParser(description="Convert IndicTrans2 model to GGML format")
-    parser.add_argument("--model-name", type=str, default="ai4bharat/indictrans2-en-indic-dist-200M",
+    parser.add_argument("--model-name", type=str, required=True,
                         help="HuggingFace model name or path to local model directory")
     parser.add_argument("--output", type=str, default="ggml-indictrans2-en-indic.bin",
                         help="Output GGML file path")
     parser.add_argument("--use-f32", action="store_true",
                         help="Use 32-bit floats instead of 16-bit")
+    parser.add_argument("--src-lang", type=str, required=True,
+                        help="Source language code (e.g., 'en' for English)")
+    parser.add_argument("--tgt-lang", type=str, required=True,
+                        help="Target language code (e.g., 'hi' for Hindi)")
     
     args = parser.parse_args()
     
@@ -447,7 +459,7 @@ def main():
         model_path = args.model_name
     
     try:
-        convert_indictrans_to_ggml(model_path, output_path, use_f16)
+        convert_indictrans_to_ggml(model_path, output_path, args.src_lang, args.tgt_lang, use_f16)
         return 0
     except Exception as e:
         print(f"Error during conversion: {e}")

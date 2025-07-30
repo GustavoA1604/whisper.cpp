@@ -854,6 +854,10 @@ struct whisper_model {
     struct ggml_tensor * m_dec_layer_norm_w;       // decoder layernorm_embedding weight
     struct ggml_tensor * m_dec_layer_norm_b;       // decoder layernorm_embedding bias
 
+    // IndicTrans2 language information
+    std::string source_language;                   // source language code (e.g., "en")
+    std::string target_language;                   // target language code (e.g., "hi")
+
     std::vector<whisper_layer_encoder> layers_encoder;
     std::vector<whisper_layer_decoder> layers_decoder;
 
@@ -1690,6 +1694,7 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
                     __func__);
                 break;
             case 2:
+            {
                 model.type = e_model::MODEL_INDICTRANS;
                 mver = " IndicTrans2";
                 // For IndicTrans2, read the additional decoder vocab size field
@@ -1708,25 +1713,46 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
                 read_safe(loader, hparams.decoder_ffn_dim);
                 read_safe(loader, hparams.encoder_layers);
                 read_safe(loader, hparams.decoder_layers);
-                
-                WHISPER_LOG_INFO("%s: Detected IndicTrans2 translation model "
-                                 "(explicit type)\n",
-                                 __func__);
-                WHISPER_LOG_INFO("%s: Encoder vocab size = %d, Decoder vocab size = %d\n", 
-                                 __func__, hparams.n_vocab, hparams.n_tgt_vocab);
+
+                int32_t src_lang_len = 0;
+                int32_t tgt_lang_len = 0;
+                read_safe(loader, src_lang_len);
+                std::vector<char> src_lang_bytes(src_lang_len);
+                loader->read(loader->context, src_lang_bytes.data(), src_lang_len);
+                model.source_language = std::string(src_lang_bytes.data(), src_lang_len);
+                read_safe(loader, tgt_lang_len);
+                std::vector<char> tgt_lang_bytes(tgt_lang_len);
+                loader->read(loader->context, tgt_lang_bytes.data(), tgt_lang_len);
+                model.target_language = std::string(tgt_lang_bytes.data(), tgt_lang_len);
+
+                WHISPER_LOG_INFO("%s: Detected IndicTrans2 translation model (explicit type)\n", __func__);
+                WHISPER_LOG_INFO("%s: Encoder vocab size = %d, Decoder vocab size = %d\n", __func__, hparams.n_vocab, hparams.n_tgt_vocab);
                 WHISPER_LOG_INFO("%s: IndicTrans2 config - normalize_before: enc=%d dec=%d, "
                                  "layernorm_embedding=%d, scale_embedding=%d\n",
-                                 __func__, hparams.encoder_normalize_before, 
-                                 hparams.decoder_normalize_before, hparams.layernorm_embedding,
+                                 __func__,
+                                 hparams.encoder_normalize_before,
+                                 hparams.decoder_normalize_before,
+                                 hparams.layernorm_embedding,
                                  hparams.scale_embedding);
                 WHISPER_LOG_INFO("%s: IndicTrans2 dimensions - encoder: %dx%d heads=%d ffn=%d layers=%d, "
                                  "decoder: %dx%d heads=%d ffn=%d layers=%d\n",
-                                 __func__, hparams.encoder_embed_dim, hparams.encoder_embed_dim,
-                                 hparams.encoder_attention_heads, hparams.encoder_ffn_dim, 
-                                 hparams.encoder_layers, hparams.decoder_embed_dim, 
-                                 hparams.decoder_embed_dim, hparams.decoder_attention_heads,
-                                 hparams.decoder_ffn_dim, hparams.decoder_layers);
+                                 __func__,
+                                 hparams.encoder_embed_dim,
+                                 hparams.encoder_embed_dim,
+                                 hparams.encoder_attention_heads,
+                                 hparams.encoder_ffn_dim,
+                                 hparams.encoder_layers,
+                                 hparams.decoder_embed_dim,
+                                 hparams.decoder_embed_dim,
+                                 hparams.decoder_attention_heads,
+                                 hparams.decoder_ffn_dim,
+                                 hparams.decoder_layers);
+                WHISPER_LOG_INFO("%s: IndicTrans2 languages - source: '%s', target: '%s'\n",
+                                 __func__,
+                                 model.source_language.c_str(),
+                                 model.target_language.c_str());
                 break;
+            }
             default:
                throw std::runtime_error("Invalid model type");
            }
@@ -4424,20 +4450,6 @@ static std::vector<whisper_vocab::id> tokenize_marian(const whisper_vocab & voca
     return tokens;
 }
 
-static std::vector<whisper_vocab::id> tokenize_sentencepiece(const whisper_vocab & vocab, const std::string & text, e_model model_type, bool use_source = true) {
-    if (model_type == MODEL_INDICTRANS) {
-        // TODO GUSTAVO: read language direction from model metadata
-        std::string preprocessed_text = indictrans_preprocess_batch(text, "en", "hi");
-        std::vector<whisper_vocab::id> tokens = tokenize_indictrans(vocab, preprocessed_text, use_source);        
-        return tokens;
-    } else if (model_type == MODEL_MARIAN) {
-        return tokenize_marian(vocab, text);
-    } else {
-        WHISPER_LOG_ERROR("Unknown translation model type for SentencePiece tokenization\n");
-        return {};
-    }
-}
-
 // BPE tokenization for Whisper models
 // split text into tokens
 //
@@ -4500,11 +4512,19 @@ static std::vector<whisper_vocab::id> tokenize_bpe(const whisper_vocab & vocab, 
 }
 
 // General tokenization function that dispatches to the appropriate tokenizer
-static std::vector<whisper_vocab::id> tokenize(const whisper_vocab & vocab, const std::string & text, e_model model_type) {
-    if (is_translation_model(model_type)) {
-        return tokenize_sentencepiece(vocab, text, model_type);
+static std::vector<whisper_vocab::id> tokenize(const whisper_context *ctx, const std::string &text, bool use_source = true) {
+    if (ctx->model.type == MODEL_INDICTRANS) {
+        std::string src_lang = ctx->model.source_language.empty() ? "en" : ctx->model.source_language;
+        std::string tgt_lang = ctx->model.target_language.empty() ? "hi" : ctx->model.target_language;
+        std::string preprocessed_text = indictrans_preprocess_batch(text, src_lang, tgt_lang);
+        return tokenize_indictrans(ctx->vocab, preprocessed_text, use_source);
+    } 
+    
+    if (ctx->model.type == MODEL_MARIAN) {
+        return tokenize_marian(ctx->vocab, text);
     }
-    return tokenize_bpe(vocab, text);
+
+    return tokenize_bpe(ctx->vocab, text);
 }
 
 //
@@ -5138,7 +5158,7 @@ int whisper_decode(struct whisper_context * ctx, const whisper_token * tokens, i
 }
 
 int whisper_tokenize(struct whisper_context * ctx, const char * text, whisper_token * tokens, int n_max_tokens) {
-    const auto res = tokenize(ctx->vocab, text, ctx->model.type);
+    const auto res = tokenize(ctx, text);
 
     if (n_max_tokens < (int) res.size()) {
         WHISPER_LOG_ERROR("%s: too many resulting tokens: %d (max %d)\n", __func__, (int) res.size(), n_max_tokens);
