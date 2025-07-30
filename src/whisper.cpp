@@ -486,6 +486,8 @@ struct whisper_vocab {
 
     std::map<token, id> token_to_id;
     std::map<id, token> id_to_token;
+    std::map<token, id> indictrans_tgt_token_to_id;
+    std::map<id, token> indictrans_tgt_id_to_token;
 
     // reference: https://github.com/openai/whisper/blob/248b6cb124225dd263bb9bd32d060b6517e067f8/whisper/tokenizer.py#L334-L349
     id token_eot        = 50256;
@@ -1881,6 +1883,19 @@ static bool whisper_model_load(struct whisper_model_loader * loader, whisper_con
                     WHISPER_LOG_INFO("%s: src_vocab_size: %d\n", __func__, vocab.indictrans_src_vocab_size);
                     WHISPER_LOG_INFO("%s: tgt_vocab_size: %d\n", __func__, vocab.indictrans_tgt_vocab_size);
                     WHISPER_LOG_INFO("%s: tokenizer_type: dual_sentencepiece\n", __func__);
+                    
+                    vocab.indictrans_tgt_id_to_token.clear();
+                    vocab.indictrans_tgt_token_to_id.clear();
+                    
+                    for (int i = 0; i < vocab.indictrans_tgt_vocab_size; i++) {
+                        try {
+                            const std::string& token = vocab.indictrans_tgt_processor->IdToPiece(i);
+                            vocab.indictrans_tgt_id_to_token[i] = token;
+                            vocab.indictrans_tgt_token_to_id[token] = i;
+                        } catch (...) {
+                            continue;
+                        }
+                    }
                 } else {
                     vocab.has_indictrans_tokenizers = false;
                 }
@@ -3278,347 +3293,325 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
     {
       cur = ggml_get_rows(ctx0, model.m_decoder_embeddings, input_ids);
       cur = ggml_scale(ctx0, cur, embed_scaling);
+      ggml_set_name(cur, "decoder_scaled_embeds");
+      const int d_model = hparams.n_text_state;
+      struct ggml_tensor * pos_emb = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d_model, 1);
+      ggml_set_name(pos_emb, "decoder_pos_emb");
+      ggml_set_input(pos_emb);
       
-      // IndicTrans2 uses sinusoidal positional embeddings (computed on the fly)
-      // For now, we skip adding positional embeddings since they're handled in the model architecture
-      // TODO: Implement sinusoidal positional embedding computation if needed
-      WHISPER_LOG_DEBUG("%s: IndicTrans2 decoder using sinusoidal positional embeddings (skipped)\n", __func__);
+      cur = ggml_add(ctx0, cur, pos_emb);
+      ggml_set_name(cur, "decoder_combined_embeds");
+      
+      if (model.m_dec_layer_norm_w != nullptr) {
+        cur = ggml_norm(ctx0, cur, hparams.eps);
+        cur = ggml_add(ctx0,
+                ggml_mul(ctx0, cur, model.m_dec_layer_norm_w),
+                model.m_dec_layer_norm_b);
+        ggml_set_name(cur, "decoder_after_layernorm");
+      }  
     }
-
 
     struct ggml_tensor * inpL = cur;
 
-    // [EXPERIMENTAL] Token-level timestamps with DTW
     struct ggml_tensor * aheads_cross_QKs = nullptr;
 
     for (int il = 0; il < n_layer; ++il) {
-       const auto & layer = model.layers_decoder[il];
-        if (!is_translation_model(model.type))
-        // norm
-        {
-            cur = ggml_norm(ctx0, inpL, hparams.eps);
-
-            // cur = ln_0_w*cur + ln_0_b
-            cur = ggml_add(ctx0,
-                    ggml_mul(ctx0,
-                        cur,
-                        layer.attn_ln_0_w),
-                    layer.attn_ln_0_b);
+        const auto &layer = model.layers_decoder[il];
+        
+        // Store residual for IndicTrans2 pre-norm architecture
+        struct ggml_tensor * residual = nullptr;
+        if (model.type == MODEL_INDICTRANS) {
+            residual = inpL;
         }
-
+        
+        // norm
+        if (!is_translation_model(model.type)) {
+            cur = ggml_norm(ctx0, inpL, hparams.eps);
+            // cur = ln_0_w*cur + ln_0_b
+            cur = ggml_add(ctx0, ggml_mul(ctx0, cur, layer.attn_ln_0_w), layer.attn_ln_0_b);
+        } else if (model.type == MODEL_INDICTRANS) {
+            // IndicTrans2 pre-norm for self-attention
+            cur = ggml_norm(ctx0, inpL, hparams.eps);
+            cur = ggml_add(ctx0, ggml_mul(ctx0, cur, layer.attn_ln_0_w), layer.attn_ln_0_b);
+            ggml_set_name(cur, "self_attn_norm");
+        }
 
         // self-attention
         {
-            struct ggml_tensor * Qcur = ggml_mul_mat(ctx0,
-                    layer.attn_q_w,
-                    inpL);
-
-            Qcur = ggml_add(ctx0,
-                        Qcur,
-                        layer.attn_q_b);
-        
+            // For IndicTrans2, use normalized input (cur), for others use inpL
+            struct ggml_tensor * attn_input = (model.type == MODEL_INDICTRANS) ? cur : inpL;
             
-            if (!is_translation_model(model.type))
-            {
-              Qcur = ggml_scale(ctx0, Qcur, KQscale);
+            struct ggml_tensor *Qcur = ggml_mul_mat(ctx0, layer.attn_q_w, attn_input);
+            Qcur = ggml_add(ctx0, Qcur, layer.attn_q_b);
+            
+            // Apply scaling to query for all models (IndicTrans2 uses head_dim**-0.5)
+            if (!is_translation_model(model.type)) {
+                Qcur = ggml_scale(ctx0, Qcur, KQscale);
+            } else if (model.type == MODEL_INDICTRANS) {
+                // IndicTrans2 scaling: self.scaling = self.head_dim**-0.5
+                Qcur = ggml_scale(ctx0, Qcur, KQscale);
             }
 
             // note: no bias for Key
-            struct ggml_tensor * Kcur = ggml_mul_mat(ctx0,
-                    layer.attn_k_w,
-                    inpL);
-
-            if (is_translation_model(model.type))
-            {
-              Kcur = ggml_add(ctx0,
-                      Kcur,
-                      layer.attn_k_b);
-            }
-            
-            if (!is_translation_model(model.type))
-            {
-              Kcur = ggml_scale(ctx0, Kcur, KQscale);
+            struct ggml_tensor *Kcur = ggml_mul_mat(ctx0, layer.attn_k_w, attn_input);
+            if (is_translation_model(model.type)) {
+                Kcur = ggml_add(ctx0, Kcur, layer.attn_k_b);
+            } else {
+                Kcur = ggml_scale(ctx0, Kcur, KQscale);
             }
 
-            // store key and value to memory
-            
-            struct ggml_tensor * Vcur = ggml_mul_mat(ctx0,
-                    layer.attn_v_w,
-                    inpL);
+            struct ggml_tensor *Vcur = ggml_mul_mat(ctx0, layer.attn_v_w, attn_input);
+            Vcur = ggml_add(ctx0, Vcur, layer.attn_v_b);
 
-            Vcur = ggml_add(ctx0,
-                        Vcur,
-                        layer.attn_v_b);
-                       
-            struct ggml_tensor * k;
-            struct ggml_tensor * v;
+            struct ggml_tensor *k;
+            struct ggml_tensor *v;
 
             if (wctx.params.flash_attn) {
-                k = ggml_view_1d(ctx0, kv_self.k, n_tokens*n_state,
-                        (ggml_element_size(kv_self.k)*n_state)*(il*n_ctx + kv_head));
-
-                v = ggml_view_1d(ctx0, kv_self.v, n_tokens*n_state,
-                        (ggml_element_size(kv_self.v)*n_state)*(il*n_ctx + kv_head));
+                k = ggml_view_1d(ctx0, kv_self.k, n_tokens * n_state, (ggml_element_size(kv_self.k) * n_state) * (il * n_ctx + kv_head));
+                v = ggml_view_1d(ctx0, kv_self.v, n_tokens * n_state, (ggml_element_size(kv_self.v) * n_state) * (il * n_ctx + kv_head));
             } else {
-                if (!is_translation_model(model.type))
-                {
-                  Vcur = ggml_transpose(ctx0, ggml_reshape_2d(ctx0, Vcur, n_state, n_tokens));
+                if (!is_translation_model(model.type)) {
+                    Vcur = ggml_transpose(ctx0, ggml_reshape_2d(ctx0, Vcur, n_state, n_tokens));
+                    k = ggml_view_1d(ctx0, kv_self.k, n_tokens * n_state, (ggml_element_size(kv_self.k) * n_state) * (il * n_ctx + kv_head));
+                    v = ggml_view_2d(ctx0,
+                                     kv_self.v,
+                                     n_tokens,
+                                     n_state,
+                                     (n_ctx)*ggml_element_size(kv_self.v),
+                                     (il * n_ctx) * ggml_element_size(kv_self.v) * n_state + kv_head * ggml_element_size(kv_self.v));
 
-                  k = ggml_view_1d(ctx0, kv_self.k, n_tokens*n_state,
-                          (ggml_element_size(kv_self.k)*n_state)*(il*n_ctx + kv_head));
-
-                  v = ggml_view_2d(ctx0, kv_self.v, n_tokens, n_state,
-                          (   n_ctx)*ggml_element_size(kv_self.v),
-                          (il*n_ctx)*ggml_element_size(kv_self.v)*n_state + kv_head*ggml_element_size(kv_self.v));
-                
-                  ggml_build_forward_expand(gf, ggml_cpy(ctx0, Kcur, k));
-                  ggml_build_forward_expand(gf, ggml_cpy(ctx0, Vcur, v));
+                    ggml_build_forward_expand(gf, ggml_cpy(ctx0, Kcur, k));
+                    ggml_build_forward_expand(gf, ggml_cpy(ctx0, Vcur, v));
                 }
             }
 
-            // ------
-
-            struct ggml_tensor * Q = nullptr;
-            if (!is_translation_model(model.type))
-            {
-              Q = ggml_permute(ctx0,
-                        ggml_reshape_3d(ctx0, Qcur, n_state_head, n_head, n_tokens),
-                        0, 2, 1, 3);
+            struct ggml_tensor *Q = nullptr;
+            if (!is_translation_model(model.type)) {
+                Q = ggml_permute(ctx0, ggml_reshape_3d(ctx0, Qcur, n_state_head, n_head, n_tokens), 0, 2, 1, 3);
+            } else {
+                Q = ggml_permute(ctx0, // n_ctx == 1500 changing this to wstate.text_tokens.size() for Marian
+                                       // Need to investigate and see what should be the value of this
+                                       // for a while translation pipeline.
+                                 ggml_reshape_3d(ctx0, Qcur, n_state_head, n_head, 1),
+                                 0,
+                                 2,
+                                 1,
+                                 3);
             }
-            else
-            {
-              Q =  ggml_permute(ctx0,                                                               // n_ctx == 1500 changing this to wstate.text_tokens.size() for Marian 
-                                                                                                    // Need to investigate and see what should be the value of this 
-                                                                                                    // for a while translation pipeline.
-                        ggml_reshape_3d(ctx0, Qcur, n_state_head, n_head, 1),
-                        0, 2, 1, 3);
- 
-            }
-            struct ggml_tensor * K = nullptr;
-            if (!is_translation_model(model.type))
-            {
-              K = ggml_view_3d(ctx0, kv_self.k,
-                      n_state_head, n_kv, n_head,
-                      ggml_element_size(kv_self.k)*n_state,
-                      ggml_element_size(kv_self.k)*n_state_head,
-                      ggml_element_size(kv_self.k)*n_state*n_ctx*il);
-            }
-            else
-            {
-              K = ggml_permute(ctx0,
-                  ggml_cast(ctx0,
-                  ggml_reshape_3d(ctx0, Kcur, n_state_head, n_head, 1),
-                                  wctx.itype),
-                                  0, 2, 1, 3);
+            struct ggml_tensor *K = nullptr;
+            if (!is_translation_model(model.type)) {
+                K = ggml_view_3d(ctx0,
+                                 kv_self.k,
+                                 n_state_head,
+                                 n_kv,
+                                 n_head,
+                                 ggml_element_size(kv_self.k) * n_state,
+                                 ggml_element_size(kv_self.k) * n_state_head,
+                                 ggml_element_size(kv_self.k) * n_state * n_ctx * il);
+            } else {
+                K = ggml_permute(ctx0, ggml_cast(ctx0, ggml_reshape_3d(ctx0, Kcur, n_state_head, n_head, 1), wctx.itype), 0, 2, 1, 3);
             }
             if (wctx.params.flash_attn) {
-                struct ggml_tensor * V =
-                    ggml_view_3d(ctx0, kv_self.v,
-                            n_state_head, n_kv, n_head,
-                            ggml_element_size(kv_self.v)*n_state,
-                            ggml_element_size(kv_self.v)*n_state_head,
-                            ggml_element_size(kv_self.v)*n_state*n_ctx*il);
+                struct ggml_tensor *V = ggml_view_3d(ctx0,
+                                                     kv_self.v,
+                                                     n_state_head,
+                                                     n_kv,
+                                                     n_head,
+                                                     ggml_element_size(kv_self.v) * n_state,
+                                                     ggml_element_size(kv_self.v) * n_state_head,
+                                                     ggml_element_size(kv_self.v) * n_state * n_ctx * il);
 
                 cur = ggml_flash_attn_ext(ctx0, Q, K, V, KQ_mask_f16, 1.0f, 0.0f, 0.0f);
 
                 cur = ggml_reshape_2d(ctx0, cur, n_state, n_tokens);
             } else {
                 // K * Q
-                struct ggml_tensor * KQ = ggml_mul_mat(ctx0, K, Q);
+                struct ggml_tensor *KQ = ggml_mul_mat(ctx0, K, Q);
 
+                struct ggml_tensor *KQ_soft_max = ggml_soft_max_ext(ctx0, KQ, nullptr, 1.0f, 0.0f);
 
-                struct ggml_tensor * KQ_soft_max = ggml_soft_max_ext(ctx0, KQ, nullptr, 1.0f, 0.0f);
-
-                struct ggml_tensor * V = nullptr;
-                if (!is_translation_model(model.type))
-                {
-                    ggml_view_3d(ctx0, kv_self.v,
-                            n_kv, n_state_head, n_head,
-                            n_ctx*ggml_element_size(kv_self.v),
-                            n_ctx*ggml_element_size(kv_self.v)*n_state_head,
-                            n_ctx*ggml_element_size(kv_self.v)*n_state*il);
+                struct ggml_tensor *V = nullptr;
+                if (!is_translation_model(model.type)) {
+                    ggml_view_3d(ctx0,
+                                 kv_self.v,
+                                 n_kv,
+                                 n_state_head,
+                                 n_head,
+                                 n_ctx * ggml_element_size(kv_self.v),
+                                 n_ctx * ggml_element_size(kv_self.v) * n_state_head,
+                                 n_ctx * ggml_element_size(kv_self.v) * n_state * il);
+                } else {
+                    V = ggml_cast(ctx0, ggml_permute(ctx0, ggml_reshape_3d(ctx0, Vcur, n_state_head, n_head, 1), 1, 2, 0, 3), wctx.itype);
                 }
-                else
-                {
-                    V = ggml_cast(ctx0,
-                            ggml_permute(ctx0,
-                                ggml_reshape_3d(ctx0,
-                                    Vcur,
-                                    n_state_head, n_head, 1),
-                                1, 2, 0, 3),
-                            wctx.itype);
- 
-                }
-                struct ggml_tensor * KQV = ggml_mul_mat(ctx0, V, KQ_soft_max);
+                struct ggml_tensor *KQV = ggml_mul_mat(ctx0, V, KQ_soft_max);
 
-                struct ggml_tensor * KQV_merged = ggml_permute(ctx0, KQV, 0, 2, 1, 3);
+                struct ggml_tensor *KQV_merged = ggml_permute(ctx0, KQV, 0, 2, 1, 3);
 
                 cur = ggml_cont_2d(ctx0, KQV_merged, n_state, 1);
-                
             }
-       }
+        }
 
         // projection
         {
-            cur = ggml_mul_mat(ctx0,
-                    layer.attn_ln_1_w,
-                    cur);
-            cur = ggml_add(ctx0,
-                    cur,
-                    layer.attn_ln_1_b);
-       }
-        // add the input
-        struct ggml_tensor * inpCA = ggml_add(ctx0, cur, inpL);
+            cur = ggml_mul_mat(ctx0, layer.attn_ln_1_w, cur);
+            cur = ggml_add(ctx0, cur, layer.attn_ln_1_b);
+        }
+        // add the input (residual connection)
+        struct ggml_tensor *inpCA;
+        if (model.type == MODEL_INDICTRANS) {
+            // IndicTrans2 pre-norm: add to original residual (before norm)
+            inpCA = ggml_add(ctx0, cur, residual);
+            ggml_set_name(inpCA, "self_attn_block");
+            
+            // Continue to cross-attention for IndicTrans2
+        } else {
+            // Original: add to input after norm
+            inpCA = ggml_add(ctx0, cur, inpL);
+        }
 
-        // ALL GOOD TILL THIS POINT FOR SECOND LAYER. 
+        // Store residual for IndicTrans2 cross-attention block
+        struct ggml_tensor * cross_residual = nullptr;
+        if (model.type == MODEL_INDICTRANS) {
+            cross_residual = inpCA; // Store before normalization for pre-norm architecture
+        }
         
         // norm
         {
             cur = ggml_norm(ctx0, inpCA, hparams.eps); // note: we use inpCA here
 
             // cur = ln_0_w*cur + ln_0_b
-            if (!is_translation_model(model.type)){
-              cur = ggml_add(ctx0,
-                      ggml_mul(ctx0,
-                          cur,
-                          layer.attn_ln_1_w),
-                      layer.attn_ln_1_b);
+            if (!is_translation_model(model.type)) {
+                cur = ggml_add(ctx0, ggml_mul(ctx0, cur, layer.attn_ln_1_w), layer.attn_ln_1_b);
+            } else if (model.type == MODEL_INDICTRANS) {
+                // IndicTrans2 cross-attention pre-norm (uses dedicated cross-attention layer norm weights)
+                cur = ggml_add(ctx0, ggml_mul(ctx0, cur, layer.cross_attn_ln_0_w), layer.cross_attn_ln_0_b);
+                ggml_set_name(cur, "cross_attn_norm");
+            } else {
+                cur = ggml_add(ctx0, ggml_mul(ctx0, cur, layer.attn_ln_0_w), layer.attn_ln_0_b);
             }
-            else
-            {
-              cur = ggml_add(ctx0,
-                      ggml_mul(ctx0,
-                          cur,
-                          layer.attn_ln_0_w),
-                      layer.attn_ln_0_b);
-            }
-            
         }
-        
-        ggml_tensor* residual = cur;
+
+        residual = cur;
         // cross-attention
         {
-            struct ggml_tensor * Qcur = ggml_mul_mat(ctx0,
-                    layer.cross_attn_q_w,
-                    cur);
+            struct ggml_tensor *Qcur = ggml_mul_mat(ctx0, layer.cross_attn_q_w, cur);
 
-            Qcur = ggml_add(ctx0,
-                        Qcur,
-                        layer.cross_attn_q_b);
+            Qcur = ggml_add(ctx0, Qcur, layer.cross_attn_q_b);
 
-            struct ggml_tensor * Q =
-                ggml_permute(ctx0,                                        // TODO HARDCODED n_tokens                                                                              to 1
-                        ggml_reshape_3d(ctx0, Qcur, n_state_head, n_head, 1),
-                        0, 2, 1, 3);
-
+            struct ggml_tensor *Q = ggml_permute(ctx0, // TODO HARDCODED n_tokens to 1
+                                                 ggml_reshape_3d(ctx0, Qcur, n_state_head, n_head, 1),
+                                                 0,
+                                                 2,
+                                                 1,
+                                                 3);
 
             if (wctx.params.flash_attn) {
-                struct ggml_tensor * Kcross =
-                    ggml_view_3d(ctx0, wstate.kv_cross.k,
-                            n_state_head, n_audio_ctx_pad, n_head,
-                            ggml_element_size(wstate.kv_cross.k)*n_state,
-                            ggml_element_size(wstate.kv_cross.k)*n_state_head,
-                            ggml_element_size(wstate.kv_cross.k)*n_state*n_audio_ctx_pad*il);
+                struct ggml_tensor *Kcross = ggml_view_3d(ctx0,
+                                                          wstate.kv_cross.k,
+                                                          n_state_head,
+                                                          n_audio_ctx_pad,
+                                                          n_head,
+                                                          ggml_element_size(wstate.kv_cross.k) * n_state,
+                                                          ggml_element_size(wstate.kv_cross.k) * n_state_head,
+                                                          ggml_element_size(wstate.kv_cross.k) * n_state * n_audio_ctx_pad * il);
 
-                struct ggml_tensor * Vcross =
-                    ggml_view_3d(ctx0, wstate.kv_cross.v,
-                            n_state_head, n_audio_ctx_pad, n_head,
-                            ggml_element_size(wstate.kv_cross.v)*n_state,
-                            ggml_element_size(wstate.kv_cross.v)*n_state_head,
-                            ggml_element_size(wstate.kv_cross.v)*n_state*n_audio_ctx_pad*il);
+                struct ggml_tensor *Vcross = ggml_view_3d(ctx0,
+                                                          wstate.kv_cross.v,
+                                                          n_state_head,
+                                                          n_audio_ctx_pad,
+                                                          n_head,
+                                                          ggml_element_size(wstate.kv_cross.v) * n_state,
+                                                          ggml_element_size(wstate.kv_cross.v) * n_state_head,
+                                                          ggml_element_size(wstate.kv_cross.v) * n_state * n_audio_ctx_pad * il);
 
                 cur = ggml_flash_attn_ext(ctx0, Q, Kcross, Vcross, nullptr, KQscale, 0.0f, 0.0f);
 
                 cur = ggml_reshape_2d(ctx0, cur, n_state, n_tokens);
             } else {
-              struct ggml_tensor * Kcross = nullptr;
-              struct ggml_tensor * Vcross = nullptr;
-              if (!is_translation_model(model.type))
-              {
-                
-                    Kcross = ggml_view_3d(ctx0, wstate.kv_cross.k,
-                            n_state_head, n_audio_ctx, n_head,
-                            ggml_element_size(wstate.kv_cross.k)*n_state,
-                            ggml_element_size(wstate.kv_cross.k)*n_state_head,
-                            ggml_element_size(wstate.kv_cross.k)*n_state*n_audio_ctx*il);
+                struct ggml_tensor *Kcross = nullptr;
+                struct ggml_tensor *Vcross = nullptr;
+                if (!is_translation_model(model.type)) {
 
-                    Vcross = ggml_view_3d(ctx0, wstate.kv_cross.v,
-                            n_audio_ctx, n_state_head, n_head,
-                            n_audio_ctx*ggml_element_size(wstate.kv_cross.v),
-                            n_audio_ctx*ggml_element_size(wstate.kv_cross.v)*n_state_head,
-                            n_audio_ctx*ggml_element_size(wstate.kv_cross.v)*n_state*il);
-              }
-              else
-              {
-                // struct ggml_tensor * Qcur = ggml_mul_mat(ctx0,
-                //         layer.cross_attn_q_w,
-                //         cur);
+                    Kcross = ggml_view_3d(ctx0,
+                                          wstate.kv_cross.k,
+                                          n_state_head,
+                                          n_audio_ctx,
+                                          n_head,
+                                          ggml_element_size(wstate.kv_cross.k) * n_state,
+                                          ggml_element_size(wstate.kv_cross.k) * n_state_head,
+                                          ggml_element_size(wstate.kv_cross.k) * n_state * n_audio_ctx * il);
 
-                // Qcur = ggml_add(ctx0,
-                //             Qcur,
-                //             layer.cross_attn_q_b);
-                
+                    Vcross = ggml_view_3d(ctx0,
+                                          wstate.kv_cross.v,
+                                          n_audio_ctx,
+                                          n_state_head,
+                                          n_head,
+                                          n_audio_ctx * ggml_element_size(wstate.kv_cross.v),
+                                          n_audio_ctx * ggml_element_size(wstate.kv_cross.v) * n_state_head,
+                                          n_audio_ctx * ggml_element_size(wstate.kv_cross.v) * n_state * il);
+                } else {
 
-                Kcross = ggml_mul_mat(ctx0, layer.cross_attn_k_w, encoder_output);
-                Kcross = ggml_add(ctx0, Kcross, layer.cross_attn_k_b);
-                Kcross = ggml_permute(ctx0,                                   // TODO HARDCODED n_tokens to 1,
-                            //ggml_cast(ctx0,
-                              ggml_reshape_3d(ctx0, Kcross, n_state_head, n_head, wstate.text_tokens.size()), 
-                            //  wctx.itype),
-                            0, 2, 1, 3);
+                    Kcross = ggml_mul_mat(ctx0, layer.cross_attn_k_w, encoder_output);
+                    Kcross = ggml_add(ctx0, Kcross, layer.cross_attn_k_b);
+                    Kcross = ggml_permute(ctx0,
+                                          ggml_reshape_3d(ctx0, Kcross, n_state_head, n_head, wstate.text_tokens.size()),
+                                          0,
+                                          2,
+                                          1,
+                                          3);
 
-                Vcross = ggml_mul_mat(ctx0, layer.cross_attn_v_w, encoder_output);
-                Vcross = ggml_add(ctx0, Vcross, layer.cross_attn_v_b);
+                    Vcross = ggml_mul_mat(ctx0, layer.cross_attn_v_w, encoder_output);
+                    Vcross = ggml_add(ctx0, Vcross, layer.cross_attn_v_b);
 
-                Vcross = ggml_permute(ctx0,                                   // TODO HARDCODED n_tokens to 1
-                            ggml_reshape_3d(ctx0, Vcross, n_state_head, n_head, wstate.text_tokens.size()),
-                            1, 2, 0, 3);
-                Vcross = ggml_cont(ctx0, Vcross);
+                    Vcross = ggml_permute(ctx0,
+                                          ggml_reshape_3d(ctx0, Vcross, n_state_head, n_head, wstate.text_tokens.size()),
+                                          1,
+                                          2,
+                                          0,
+                                          3);
+                    Vcross = ggml_cont(ctx0, Vcross);
 
-                // Vcross = ggml_cast(ctx0, Vcross, wctx.itype);
-              }
-                // ------
+                }
+
                 // K * Q
-              struct ggml_tensor * KQ = ggml_mul_mat(ctx0, Kcross, Q);
+                struct ggml_tensor *KQ = ggml_mul_mat(ctx0, Kcross, Q);
+                struct ggml_tensor *KQ_soft_max = ggml_soft_max_ext(ctx0, KQ, nullptr, KQscale, 0.0f);
+                struct ggml_tensor *KQV = ggml_mul_mat(ctx0, Vcross, KQ_soft_max);
+                struct ggml_tensor *KQV_merged = ggml_permute(ctx0, KQV, 0, 2, 1, 3);
 
-              struct ggml_tensor * KQ_soft_max = ggml_soft_max_ext(ctx0, KQ, nullptr, KQscale, 0.0f);
-
-              struct ggml_tensor * KQV = ggml_mul_mat(ctx0, Vcross, KQ_soft_max);
-
-              struct ggml_tensor * KQV_merged = ggml_permute(ctx0, KQV, 0, 2, 1, 3);
-
-              if (!is_translation_model(model.type))
-              {
-                cur = ggml_cont_2d(ctx0, KQV_merged, n_state, n_tokens);
-              }
-              else
-              {
-                cur = ggml_cont_2d(ctx0, KQV_merged, n_state, 1);
-              }
+                if (!is_translation_model(model.type)) {
+                    cur = ggml_cont_2d(ctx0, KQV_merged, n_state, n_tokens);
+                } else {
+                    cur = ggml_cont_2d(ctx0, KQV_merged, n_state, 1);
+                }
             }
-            
         }
-        
+
         // projection
         {
-            cur = ggml_mul_mat(ctx0,
-                    layer.cross_attn_ln_1_w,
-                    cur);
-
-            cur = ggml_add(ctx0,
-                    cur,
-                    layer.cross_attn_ln_1_b);
+            cur = ggml_mul_mat(ctx0, layer.cross_attn_ln_1_w, cur);
+            cur = ggml_add(ctx0, cur, layer.cross_attn_ln_1_b);
         }
-       
-        // add the input
-        // The residual is fine.
-        cur = ggml_add(ctx0, cur, residual);
 
- 
-        struct ggml_tensor * inpFF = nullptr; 
-        if (!is_translation_model(model.type))
-        {
-          inpFF = cur;
+        // add the input (residual connection)
+        if (model.type == MODEL_INDICTRANS) {
+            // IndicTrans2 pre-norm: add to cross_residual (before cross-attention norm)
+            cur = ggml_add(ctx0, cur, cross_residual);
+            ggml_set_name(cur, "cross_attn_block");
+        } else {
+            // Original: add to residual (after norm)
+            cur = ggml_add(ctx0, cur, residual);
+        }
+
+        // Store residual for IndicTrans2 FFN block
+        struct ggml_tensor *ffn_residual = nullptr;
+        if (model.type == MODEL_INDICTRANS) {
+            ffn_residual = cur; // Store before normalization for pre-norm architecture
+        }
+        
+        struct ggml_tensor *inpFF = nullptr;
+        if (!is_translation_model(model.type)) {
+            inpFF = cur;
         }
 
         // feed-forward network
@@ -3628,74 +3621,59 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
                 cur = ggml_norm(ctx0, cur, hparams.eps);
 
                 // cur = mlp_ln_w*cur + mlp_ln_b
-                if (!is_translation_model(model.type))
-                {
-                  cur = ggml_add(ctx0,
-                          ggml_mul(ctx0,
-                              cur,
-                              layer.mlp_ln_w),
-                          layer.mlp_ln_b);
- 
+                if (!is_translation_model(model.type)) {
+                    cur = ggml_add(ctx0, ggml_mul(ctx0, cur, layer.mlp_ln_w), layer.mlp_ln_b);
+                } else if (model.type == MODEL_INDICTRANS) {
+                    // IndicTrans2 FFN pre-norm (uses final_layer_norm weights)
+                    cur = ggml_add(ctx0, ggml_mul(ctx0, cur, layer.mlp_ln_w), layer.mlp_ln_b);
+                    ggml_set_name(cur, "ffn_norm");
+                } else {
+                    // Other translation models (Marian) - keep existing behavior
+                    cur = ggml_add(ctx0, ggml_mul(ctx0, cur, layer.cross_attn_ln_0_w), layer.cross_attn_ln_0_b);
                 }
-                else
-                {
-                  cur = ggml_add(ctx0,
-                          ggml_mul(ctx0,
-                              cur,
-                              layer.cross_attn_ln_0_w),
-                          layer.cross_attn_ln_0_b);
+            }
 
-                }
-          }
-
-            // residual 
-            if (is_translation_model(model.type))
-            {
-              inpFF = cur;
+            // residual
+            if (is_translation_model(model.type) && model.type != MODEL_INDICTRANS) {
+                inpFF = cur;
             }
             // fully connected
-            cur = ggml_mul_mat(ctx0,
-                    layer.mlp_0_w,
-                    cur);
+            cur = ggml_mul_mat(ctx0, layer.mlp_0_w, cur);
 
-            cur = ggml_add(ctx0,
-                    cur,
-                    layer.mlp_0_b);
- 
-            if (!is_translation_model(model.type))
-            {
-              // GELU activation
-              cur = ggml_gelu(ctx0, cur);
-            }
-            else
-            {
-              cur = ggml_silu(ctx0, cur);
+            cur = ggml_add(ctx0, cur, layer.mlp_0_b);
+
+            if (!is_translation_model(model.type)) {
+                // GELU activation
+                cur = ggml_gelu(ctx0, cur);
+            } else if (model.type == MODEL_INDICTRANS) {
+                // IndicTrans2 uses GELU activation (config.activation_function = "gelu")
+                cur = ggml_gelu(ctx0, cur);
+                ggml_set_name(cur, "fc1_activation");
+            } else {
+                // Other translation models (Marian) use SiLU
+                cur = ggml_silu(ctx0, cur);
             }
 
-           
             // projection
-            cur = ggml_mul_mat(ctx0,
-                    layer.mlp_1_w,
-                    cur);
+            cur = ggml_mul_mat(ctx0, layer.mlp_1_w, cur);
 
-            cur = ggml_add(ctx0,
-                    cur,
-                    layer.mlp_1_b);
-          
+            cur = ggml_add(ctx0, cur, layer.mlp_1_b);
         }
 
-        cur = ggml_add(ctx0, cur, inpFF);
-        cur = ggml_norm(ctx0, cur, hparams.eps);
-
-        inpL = ggml_add(ctx0,
-                ggml_mul(ctx0,
-                    cur,
-                    layer.mlp_ln_w),
-                layer.mlp_ln_b);
-
+        // FFN residual connection
+        if (model.type == MODEL_INDICTRANS) {
+            // IndicTrans2 pre-norm: add FFN output to ffn_residual (before FFN norm)
+            cur = ggml_add(ctx0, cur, ffn_residual);
+            ggml_set_name(cur, "ffn_block");
+        } else {
+            // Original: add to inpFF
+            cur = ggml_add(ctx0, cur, inpFF);
+        }
+        
+        // Update inpL for next layer
+        inpL = cur;
     }
 
- 
     cur = inpL;
     struct ggml_tensor * logits = nullptr;
 
@@ -3736,14 +3714,13 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
     }
     else if (model.type == MODEL_INDICTRANS)
     {
-      // IndicTrans2 uses shared embeddings instead of separate lm_head
-      // decoder_embeddings shape: [decoder_vocab_size, hidden_size]
-      // cur shape: [hidden_size, sequence_length]  
-      // result: [decoder_vocab_size, sequence_length]
+      if (model.m_decoder_norm_w != nullptr) {
+          cur = ggml_norm(ctx0, cur, hparams.eps);
+          cur = ggml_add(ctx0, ggml_mul(ctx0, cur, model.m_decoder_norm_w), model.m_decoder_norm_b);
+          ggml_set_name(cur, "final_decoder_norm");
+      }
       logits = ggml_mul_mat(ctx0, model.m_decoder_embeddings, cur);
-      // No final_logits_bias for IndicTrans2
     }
-
 
     ggml_build_forward_expand(gf, logits);
     wstate.debug_tensor = logits;
@@ -3752,63 +3729,126 @@ static struct ggml_cgraph * whisper_build_graph_decoder(
     return gf;
 }
 
-static bool marian_decode_internal(
-        whisper_context & wctx,
-          whisper_state & wstate)
-{
+static bool marian_decode_internal(whisper_context &wctx, whisper_state &wstate) {
     std::vector<float> buffer(10);
-    ggml_backend_tensor_get(wstate.embd_enc, buffer.data(), 0, sizeof(float) * 10 );
-    for (auto&& el : buffer)
-    {
-       std::cout<<std::setprecision(4)<<el<<" ";
+    ggml_backend_tensor_get(wstate.embd_enc, buffer.data(), 0, sizeof(float) * 10);
+
+    auto &sched = wstate.sched_decode.sched;
+    ggml_cgraph *gf = whisper_build_graph_decoder(wctx, wstate, wstate.batch, false, false);
+
+    if (!ggml_backend_sched_alloc_graph(sched, gf)) {
+        // should never happen as we pre-allocate the memory
+        return false;
     }
+
+    // set inputs
+    {
+        ggml_tensor *input_ids = ggml_graph_get_tensor(gf, "input_ids");
+        if (input_ids != nullptr) {
+            int32_t bos_token_id = 2;
+            ggml_backend_tensor_set(input_ids, &bos_token_id, 0, sizeof(bos_token_id));
+        }
+        ggml_tensor *position_tensor = ggml_graph_get_tensor(gf, "position");
+        if (position_tensor != nullptr) {
+            // TODO Need to understand what this position is used for. For now will hardcode it to
+            // 0 since that's the value it takes for the first inference in python
+            int32_t position = 0;
+            ggml_backend_tensor_set(position_tensor, &position, 0, sizeof(position));
+        }
+
+        // Need to figure out how to pass the encoder output.
+        // simply giving the ggml_tensor does not seem to work.
+        // Though whisper is doing it like that.
+        ggml_tensor *encoder_output = ggml_graph_get_tensor(gf, "encoder_output");
+        if (encoder_output != nullptr) {
+            ggml_backend_tensor_set(encoder_output, wstate.encoder_result.data(), 0, sizeof(float) * wstate.encoder_result.size());
+        }
+
+        // Set sinusoidal positional embeddings for IndicTrans2 decoder
+        ggml_tensor *decoder_pos_emb = ggml_graph_get_tensor(gf, "decoder_pos_emb");
+        if (decoder_pos_emb != nullptr) {
+            const int d_model = 512;                     // From Python baseline
+            const int logical_pos = 0;                   // First decoder position (BOS token)
+            const int offset = 2;                        // IndicTrans2 offset
+            const int actual_pos = logical_pos + offset; // Position 2 in sinusoidal table
+            const int table_size = actual_pos + 1;       // Need at least positions 0-2
+
+            // Create sinusoidal table using existing function
+            std::vector<float> pos_table(d_model * table_size);
+            compute_sinusoidal_positional_embeddings_to_buffer(pos_table.data(), d_model, table_size);
+
+            // Extract the embeddings for the specific position we need
+            std::vector<float> pos_embeds(d_model);
+            std::copy(pos_table.begin() + actual_pos * d_model, pos_table.begin() + (actual_pos + 1) * d_model, pos_embeds.begin());
+
+            ggml_backend_tensor_set(decoder_pos_emb, pos_embeds.data(), 0, sizeof(float) * pos_embeds.size());
+        }
+    }
+
+    // hardcoded n_threads to 4 .
+    if (!ggml_graph_compute_helper(sched, gf, 4)) {
+        return false;
+    }
+
+    // Print decoder intermediate values for debugging
+    {
+        ggml_tensor * debug_tensor = wstate.debug_tensor;
+        if (debug_tensor != nullptr) {
+            std::vector<float> debug_buffer(debug_tensor->ne[0]);
+            ggml_backend_tensor_get(debug_tensor, debug_buffer.data(), 0, sizeof(float) * debug_buffer.size());
+            
+            std::cout << "\nlogits_shape: [1, 1, " << debug_tensor->ne[0] << "]\n";
+            std::cout << "logits_first_5: [";
+            for (int i = 0; i < std::min(5, (int)debug_buffer.size()); i++) {
+                std::cout << std::fixed << std::setprecision(6) << debug_buffer[i];
+                if (i < 4) std::cout << ", ";
+            }
+            std::cout << "]\nlogits_last_5: [";
+            for (int i = std::max(0, (int)debug_buffer.size() - 5); i < (int)debug_buffer.size(); i++) {
+                std::cout << std::fixed << std::setprecision(6) << debug_buffer[i];
+                if (i < (int)debug_buffer.size() - 1) std::cout << ", ";
+            }
+            std::cout << "]" << std::endl;
+            
+            // Compute softmax probabilities and find next token
+            if (debug_buffer.size() > 0) {
+                // Find max value for numerical stability
+                float max_logit = *std::max_element(debug_buffer.begin(), debug_buffer.end());
+                
+                // Compute softmax probabilities
+                std::vector<float> probabilities(debug_buffer.size());
+                float sum_exp = 0.0f;
+                for (size_t i = 0; i < debug_buffer.size(); i++) {
+                    probabilities[i] = expf(debug_buffer[i] - max_logit);
+                    sum_exp += probabilities[i];
+                }
+                for (size_t i = 0; i < probabilities.size(); i++) {
+                    probabilities[i] /= sum_exp;
+                }
+                
+                // Find next token (argmax)
+                int next_token_id = 0;
+                float max_prob = probabilities[0];
+                for (size_t i = 1; i < probabilities.size(); i++) {
+                    if (probabilities[i] > max_prob) {
+                        max_prob = probabilities[i];
+                        next_token_id = i;
+                    }
+                }
+                
+                std::cout << "next_token_id: " << next_token_id << std::endl;
+                std::cout << "next_token_prob: " << std::fixed << std::setprecision(6) << max_prob << std::endl;
+            }
+            
+            std::cout << std::endl;
+        }
+    }
+
     std::cout.flush();
- 
-  auto& sched = wstate.sched_decode.sched;
-  ggml_cgraph* gf = whisper_build_graph_decoder(wctx, wstate, wstate.batch, false, false);
 
-  if (!ggml_backend_sched_alloc_graph(sched, gf)) {
-      // should never happen as we pre-allocate the memory
-      return false;
-  }
-
-  // set inputs
-  {
-    ggml_tensor* input_ids = ggml_graph_get_tensor(gf, "input_ids");
-    if (input_ids != nullptr)
-    {
-      // the bos_token_id is hardcoded for now, need to figure out how to query it from the vocab.
-      int32_t bos_token_id = 80034; 
-      ggml_backend_tensor_set(input_ids, &bos_token_id, 0, sizeof(bos_token_id));
-    }
-    ggml_tensor* position_tensor = ggml_graph_get_tensor(gf, "position");
-    if ( position_tensor != nullptr )
-    {
-      // TODO Need to understand what this position is used for. For now will hardcode it to 
-      // 0 since that's the value it takes for the first inference in python
-      int32_t position = 0;
-      ggml_backend_tensor_set(position_tensor, &position, 0, sizeof(position));
-    }
-
-    // Need to figure out how to pass the encoder output.
-    // simply giving the ggml_tensor does not seem to work. 
-    // Though whisper is doing it like that.
-    ggml_tensor* encoder_output = ggml_graph_get_tensor(gf, "encoder_output");
-    if ( encoder_output != nullptr )
-    {
-      ggml_backend_tensor_set(encoder_output, wstate.encoder_result.data(), 0, sizeof(float) * wstate.encoder_result.size());
-    }
-   }
-
-  // hardcoded n_threads to 4 .
-  if (!ggml_graph_compute_helper(sched, gf, 4)) {
-      return false;
-  }
-  
-  std::cout.flush();
-
-  return true;
+    return true;
 }
+
 // evaluate the decoder
 //
 // given text prompt + audio features -> computes the logits for the next token
@@ -8044,7 +8084,7 @@ int indictrans_full(struct whisper_context * ctx,
 
     if (res.empty()) {
         std::cout << "Tokenization failed!" << std::endl;
-        return -1;
+        return -3;
     }
     
     print_tokens(ctx, res);
@@ -8055,12 +8095,11 @@ int indictrans_full(struct whisper_context * ctx,
         return -1;
     }
 
-    /* // decoder - reuse marian decoder since it's the same transformer architecture  
     if (!marian_decode_internal(*ctx, *ctx->state)) {
         std::cout << "Failed to run decoder" << std::endl;
         std::cout.flush();
         return -2;
-    } */
+    }
 
     return 0;
 }
