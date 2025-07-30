@@ -7981,37 +7981,42 @@ static bool whisper_vad(
     }
 
     return true;
-}    
+}
+
+static void print_tokens(struct whisper_context * ctx, const std::vector<whisper_token> & tokens) {
+    std::cout << "Tokens: ";
+    for (unsigned int i = 0; i < tokens.size(); i++) {
+        std::cout << tokens[i];
+        if (i < tokens.size() - 1) std::cout << ", ";
+    }
+    std::cout << std::endl;
+
+    std::cout << "Token strings: ";
+    for (unsigned int i = 0; i < tokens.size(); i++) {
+        const char *token_str = whisper_token_to_str(ctx, tokens[i]);
+        std::cout << "\"" << (token_str ? token_str : "<null>") << "\"";
+        if (i < tokens.size() - 1) {
+            std::cout << ", ";
+        }
+    }
+    std::cout << std::endl;
+}
 
 int marian_full(struct whisper_context * ctx,
                 const char* input_text) {
     ctx->state->result_all.clear();
 
-    int n_tokens = whisper_token_count(ctx, input_text);
-    ctx->state->text_tokens.resize(n_tokens);
+    const auto res = tokenize(ctx, input_text);
+    ctx->state->text_tokens = res;
 
-    int actual_tokens = whisper_tokenize(ctx, input_text, ctx->state->text_tokens.data(), n_tokens);
-    if (actual_tokens > 0) {
-            std::cout << "Tokenization successful!" << std::endl;
-            std::cout << "Tokens: ";
-            for (int i = 0; i < actual_tokens; i++) {
-                std::cout << ctx->state->text_tokens[i];
-                if (i < actual_tokens - 1) std::cout << ", ";
-            }
-            std::cout << std::endl;
-            
-            std::cout << "Token strings: ";
-            for (int i = 0; i < actual_tokens; i++) {
-                const char* token_str = whisper_token_to_str(ctx, ctx->state->text_tokens[i]);
-                std::cout << "\"" << (token_str ? token_str : "<null>") << "\"";
-                if (i < actual_tokens - 1) std::cout << ", ";
-            }
-            std::cout << std::endl;
-        } else {
-            std::cout << "Tokenization failed!" << std::endl;
-        }
+    if (res.empty()) {
+        std::cout << "Tokenization failed!" << std::endl;
+        return -1;
+    }
+    
+    print_tokens(ctx, res);
 
-    // encoder 
+    // encoder
     if (!marian_encode_internal(*ctx, *ctx->state))
     {
       std::cout<<"Failed to run encoder."<<std::endl;
@@ -8034,29 +8039,15 @@ int indictrans_full(struct whisper_context * ctx,
                    const char* input_text) {
     ctx->state->result_all.clear();
 
-    int n_tokens = whisper_token_count(ctx, input_text);
-    ctx->state->text_tokens.resize(n_tokens);
+    const auto res = tokenize(ctx, input_text);
+    ctx->state->text_tokens = res;
 
-    int actual_tokens = whisper_tokenize(ctx, input_text, ctx->state->text_tokens.data(), n_tokens);
-    if (actual_tokens > 0) {
-        std::cout << "Tokenization successful!" << std::endl;
-        std::cout << "Tokens: ";
-        for (int i = 0; i < actual_tokens; i++) {
-            std::cout << ctx->state->text_tokens[i];
-            if (i < actual_tokens - 1) std::cout << ", ";
-        }
-        std::cout << std::endl;
-        
-        std::cout << "Token strings: ";
-        for (int i = 0; i < actual_tokens; i++) {
-            const char* token_str = whisper_token_to_str(ctx, ctx->state->text_tokens[i]);
-            std::cout << "\"" << (token_str ? token_str : "<null>") << "\"";
-            if (i < actual_tokens - 1) std::cout << ", ";
-        }
-        std::cout << std::endl;
-    } else {
+    if (res.empty()) {
         std::cout << "Tokenization failed!" << std::endl;
+        return -1;
     }
+    
+    print_tokens(ctx, res);
 
     if (!marian_encode_internal(*ctx, *ctx->state)) {
         std::cout << "Failed to run encoder." << std::endl;
